@@ -652,7 +652,12 @@ data:
     <!DOCTYPE html>
     <html lang="en">
     <head>
-    <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    <meta name="theme-color" content="#161b22">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="mobile-web-app-capable" content="yes">
     <title>TraderPro — Live Market Data</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
@@ -746,7 +751,7 @@ data:
     .wl-header{background:#161b22;border-bottom:1px solid #21262d;padding:0 8px;flex-shrink:0}
     .wl-cols{display:grid;grid-template-columns:62px 1fr 72px 58px 62px 62px 62px 62px 26px;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;padding:6px 4px;font-weight:600}
     .wl-cols span{text-align:right}.wl-cols span:first-child,.wl-cols span:nth-child(2){text-align:left}
-    .wl-body{overflow-y:auto;flex:1}
+    .wl-body{overflow-y:auto;flex:1;-webkit-overflow-scrolling:touch}
     .wl-row{display:grid;grid-template-columns:62px 1fr 72px 58px 62px 62px 62px 62px 26px;align-items:center;padding:7px 4px;border-bottom:1px solid #21262d0a;cursor:pointer;transition:background .1s}
     .wl-row:hover{background:#161b2280}
     .wl-row.active{background:#1f6feb15;border-left:2px solid #58a6ff}
@@ -799,7 +804,7 @@ data:
     .rec-src{font-size:10px;background:#f0883e22;color:#f0883e;border:1px solid #f0883e44;border-radius:10px;padding:2px 8px;font-weight:600}
     .rec-refresh{margin-left:auto;font-size:11px;color:#8b949e;cursor:pointer;background:none;border:none;color:#8b949e}
     .rec-refresh:hover{color:#e6edf3}
-    .rec-cards{display:flex;gap:10px;overflow-x:auto;padding-bottom:4px;scrollbar-width:thin;scrollbar-color:#30363d transparent}
+    .rec-cards{display:flex;gap:10px;overflow-x:auto;padding-bottom:4px;scrollbar-width:thin;scrollbar-color:#30363d transparent;-webkit-overflow-scrolling:touch}
     .rec-cards::-webkit-scrollbar{height:4px}.rec-cards::-webkit-scrollbar-thumb{background:#30363d;border-radius:2px}
     .rec-card{background:#161b22;border:1px solid #21262d;border-radius:12px;padding:13px 14px;min-width:168px;max-width:168px;cursor:pointer;transition:border-color .15s,transform .12s,box-shadow .15s;flex-shrink:0;position:relative}
     .rec-card:hover{border-color:#58a6ff55;transform:translateY(-2px);box-shadow:0 6px 20px #58a6ff10}
@@ -824,6 +829,88 @@ data:
     .rc-add:hover{background:#388bfd}
     .rc-add.added{background:#3fb95030;color:#3fb950;border:1px solid #3fb95050;cursor:default}
     .rec-empty{color:#8b949e;font-size:12px;padding:8px 0}
+
+    /* ══════════════════════════════════════════════
+       RESPONSIVE — Tablet  (≤ 1100px)
+       ══════════════════════════════════════════════ */
+    @media (max-width:1100px){
+      .watchlist{width:340px}
+      .wl-cols,.wl-row{grid-template-columns:60px 1fr 72px 56px 26px}
+      .wl-cols span:nth-child(5),.wl-cols span:nth-child(6),
+      .wl-cols span:nth-child(7),.wl-cols span:nth-child(8){display:none}
+      .wl-row .ma-cell{display:none}
+      .detail-panel{width:240px}
+      .ch-ma-legend{gap:10px;flex-wrap:wrap}
+    }
+
+    /* ══════════════════════════════════════════════
+       RESPONSIVE — Mobile  (≤ 767px)
+       ══════════════════════════════════════════════ */
+    @media (max-width:767px){
+      /* Allow page to scroll vertically */
+      body{height:auto;min-height:100vh;overflow-y:auto;overflow-x:hidden}
+
+      /* Nav — compact, search takes full width */
+      nav{height:50px;padding:0 10px;gap:8px}
+      .logo{font-size:15px;flex-shrink:0}
+      .logo span{display:none}          /* hide "Pro" suffix */
+      .clock{display:none}
+      .search-wrap{max-width:none}
+      .search-inp{font-size:13px;padding:8px 10px 8px 32px}
+      .search-inp::placeholder{font-size:11px}
+      .search-drop{max-height:65vh;border-radius:0 0 12px 12px}
+      .si-exch,.si-sec,.si-add-hint{display:none}   /* simplify dropdown rows */
+
+      /* Ticker — hide to save vertical space */
+      .ticker{display:none}
+
+      /* Rec strip — tighter padding */
+      .rec-section{padding:10px 10px 12px}
+      .rec-src{display:none}
+      .rec-hdr{gap:6px}
+      .rec-card{min-width:152px;max-width:152px;padding:11px 11px}
+      .rc-price{font-size:14px}
+      .rc-add{font-size:10px;padding:4px 0}
+
+      /* Main: stack vertically, allow scroll */
+      .main{flex-direction:column;overflow:visible;height:auto}
+
+      /* Watchlist — full width, 4 visible columns */
+      .watchlist{width:100%;border-right:none;border-bottom:1px solid #30363d;max-height:none}
+      .wl-cols,.wl-row{grid-template-columns:68px 1fr 80px 60px 26px}
+      .wl-cols span:nth-child(5),.wl-cols span:nth-child(6),
+      .wl-cols span:nth-child(7),.wl-cols span:nth-child(8){display:none}
+      .wl-row .ma-cell{display:none}
+      .wl-row{padding:9px 6px}
+      .sym{font-size:12px}
+      .price{font-size:12px}
+      .chg{font-size:10px}
+
+      /* Chart area — full width */
+      .chart-area{border-right:none;min-height:300px}
+      .ch-price{font-size:22px}
+      .ch-ma-legend{flex-wrap:wrap;gap:6px;margin-top:4px}
+      .ch-ma-item{font-size:10px}
+      .chart-wrap{padding:8px 10px}
+
+      /* Detail panel — full width below chart */
+      .detail-panel{width:100%;border-left:none}
+      .fund-grid{grid-template-columns:1fr 1fr 1fr}  /* 3 cols on mobile */
+      .analyst-grid{grid-template-columns:repeat(5,1fr)}
+
+      /* Chart header */
+      .chart-header{padding:8px 12px}
+    }
+
+    /* ══════════════════════════════════════════════
+       RESPONSIVE — Small phones  (≤ 390px, iPhone SE)
+       ══════════════════════════════════════════════ */
+    @media (max-width:390px){
+      .logo{display:none}
+      .wl-cols,.wl-row{grid-template-columns:62px 1fr 74px 54px 24px}
+      .rec-card{min-width:140px;max-width:140px}
+      .fund-grid{grid-template-columns:1fr 1fr}
+    }
     </style>
     </head>
     <body>
@@ -1014,7 +1101,7 @@ data:
         const flag   = FLAG[r.country] || '🌐';
         const wl     = r.in_watchlist ? '<span class="si-wl-tag">✓ In watchlist</span>' : '<span class="si-add-hint">↵ Add</span>';
         const cls    = r.in_watchlist ? ' in-wl' : '';
-        return `<div class="search-item${cls}" data-i="${i}" onmousedown="pickFromDrop(${i})">
+        return `<div class="search-item${cls}" data-i="${i}" onpointerdown="pickFromDrop(${i})">
           <span class="si-flag">${flag}</span>
           <span class="si-sym">${r.symbol}</span>
           <span class="si-name">${r.name}</span>
@@ -1215,6 +1302,11 @@ data:
       sel = sym;
       renderWatchlist();
       document.getElementById('chart-empty').style.display = 'none';
+      // On mobile: scroll chart into view after selection
+      if (window.innerWidth <= 767) {
+        setTimeout(() => document.querySelector('.chart-area')
+          .scrollIntoView({behavior:'smooth', block:'start'}), 80);
+      }
       try {
         const r = await fetch(API + '/stock/' + sym);
         if (!r.ok) { document.getElementById('chart-empty').textContent = 'Loading data…'; return; }
