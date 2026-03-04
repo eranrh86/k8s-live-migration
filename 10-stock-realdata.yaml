@@ -7,7 +7,7 @@ metadata:
   namespace: stock-app
 data:
   app.py: |
-    import os, time, threading, random
+    import os, time, threading, random, json, ssl, urllib.request as _ureq
     from flask import Flask, jsonify, request
     from flask_cors import CORS
 
@@ -31,6 +31,11 @@ data:
     fund_cache  = {}   # sym -> {fundamentals}
     data_lock   = threading.Lock()
     loading_set = set()
+
+    # Recommendations cache
+    rec_cache = []
+    rec_lock  = threading.Lock()
+    REC_ORDER = {"strong_buy": 1, "buy": 2, "hold": 3, "underperform": 4, "sell": 5}
 
     # ── Stock catalog for search autocomplete ──────────────────────
     # Each entry: (symbol, full_name, exchange, sector, country_code)
@@ -373,6 +378,94 @@ data:
     threading.Thread(target=initial_load, daemon=True).start()
     threading.Thread(target=refresh_loop, daemon=True).start()
 
+    def fetch_recommendations():
+        """Fetch StockTwits trending + combine with yfinance analyst data."""
+        global rec_cache
+        time.sleep(90)   # wait for initial_load to complete first
+        ctx = ssl.create_default_context()
+        catalog_syms = {c[0] for c in CATALOG}
+        while True:
+            try:
+                # ── 1. StockTwits trending symbols (1 HTTP call) ──────
+                trending_pairs = []
+                try:
+                    req = _ureq.Request(
+                        "https://api.stocktwits.com/api/2/trending/symbols.json",
+                        headers={"User-Agent": "Mozilla/5.0 (compatible; StockApp/1.0)"})
+                    with _ureq.urlopen(req, context=ctx, timeout=8) as h:
+                        data = json.loads(h.read())
+                    trending_pairs = [(s["symbol"], s.get("watchlist_count", 0))
+                                      for s in data.get("symbols", [])[:30]]
+                    print(f"StockTwits: {[s[0] for s in trending_pairs[:8]]}", flush=True)
+                except Exception as e:
+                    print(f"StockTwits unavailable: {e}", flush=True)
+
+                # ── 2. Merge trending + analyst-rated from fund_cache ──
+                seen, ranked = set(), []
+                # Trending first (social signal)
+                for sym, wl in trending_pairs:
+                    if sym in catalog_syms and sym not in seen:
+                        ranked.append((sym, wl, True))
+                        seen.add(sym)
+                # Analyst picks from already-loaded data (fallback + supplement)
+                with data_lock:
+                    fund_snap  = dict(fund_cache)
+                    price_snap = dict(price_cache)
+                for sym, fd in fund_snap.items():
+                    if sym in seen: continue
+                    if (fd.get("rec") or "") in ("strong_buy", "buy"):
+                        ranked.append((sym, 0, False))
+                        seen.add(sym)
+
+                # ── 3. Trigger load for top unloaded catalog symbols ───
+                needs_load = [s for s, _, _ in ranked[:15] if s not in price_snap and s in catalog_syms]
+                threads = [threading.Thread(target=load_stock, args=(s,), daemon=True) for s in needs_load]
+                for t in threads: t.start()
+                if threads:
+                    for t in threads: t.join(timeout=30)   # wait up to 30s for data
+
+                # ── 4. Build result list ───────────────────────────────
+                results = []
+                for rank_i, (sym, wl_cnt, is_social) in enumerate(ranked):
+                    with data_lock:
+                        pd = price_cache.get(sym)
+                        fd = fund_cache.get(sym)
+                    if not pd or not fd: continue
+                    rec    = (fd.get("rec") or "hold").lower()
+                    target = fd.get("target_mean")
+                    price  = pd.get("price", 0)
+                    upside = round((target - price) / price * 100, 1) if (target and price > 0) else None
+                    results.append({
+                        "symbol":      sym,
+                        "name":        fd.get("name", sym),
+                        "price":       price,
+                        "change":      pd.get("change", 0),
+                        "pct":         pd.get("pct", 0),
+                        "currency":    pd.get("currency", "USD"),
+                        "rec":         rec,
+                        "rec_mean":    fd.get("strong_buy"),
+                        "target":      target,
+                        "upside":      upside,
+                        "analysts":    fd.get("num_analysts") or 0,
+                        "sector":      fd.get("sector", ""),
+                        "social_rank": rank_i + 1 if is_social else None,
+                        "wl_count":    wl_cnt,
+                    })
+
+                # ── 5. Sort: strong_buy first, then by upside% ─────────
+                results.sort(key=lambda x: (
+                    REC_ORDER.get(x["rec"], 3),
+                    -(x.get("upside") or -999)
+                ))
+                with rec_lock:
+                    rec_cache = results[:10]
+                print(f"Recs updated: {[r['symbol']+'/'+r['rec'] for r in rec_cache[:5]]}", flush=True)
+            except Exception as e:
+                print(f"fetch_recommendations error: {e}", flush=True)
+            time.sleep(900)  # refresh every 15 minutes
+
+    threading.Thread(target=fetch_recommendations, daemon=True).start()
+
     @app.route("/health")
     def health():
         return "ok"
@@ -417,6 +510,12 @@ data:
         if not d:
             return jsonify({"error": "not found or still loading"}), 404
         return jsonify({"symbol": symbol, **d, "fundamentals": f})
+
+    @app.route("/api/recommendations")
+    def get_recommendations():
+        with rec_lock:
+            recs = list(rec_cache)
+        return jsonify({"recommendations": recs, "ts": int(time.time())})
 
     @app.route("/api/catalog")
     def get_catalog():
@@ -692,6 +791,39 @@ data:
     .mig-key{color:#8b949e}.mig-val{color:#58a6ff;font-family:monospace;font-size:10px}
     .live-dot{width:7px;height:7px;border-radius:50%;background:#3fb950;box-shadow:0 0 6px #3fb950;display:inline-block;margin-right:5px;animation:pulse 2s infinite}
     @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+    /* ── Our Recommendation section ── */
+    .rec-section{background:#0d1117;border-bottom:1px solid #21262d;padding:12px 16px 14px;flex-shrink:0}
+    .rec-hdr{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+    .rec-title{font-size:13px;font-weight:700;color:#e6edf3;display:flex;align-items:center;gap:6px}
+    .rec-sub{font-size:11px;color:#8b949e;margin-left:4px}
+    .rec-src{font-size:10px;background:#f0883e22;color:#f0883e;border:1px solid #f0883e44;border-radius:10px;padding:2px 8px;font-weight:600}
+    .rec-refresh{margin-left:auto;font-size:11px;color:#8b949e;cursor:pointer;background:none;border:none;color:#8b949e}
+    .rec-refresh:hover{color:#e6edf3}
+    .rec-cards{display:flex;gap:10px;overflow-x:auto;padding-bottom:4px;scrollbar-width:thin;scrollbar-color:#30363d transparent}
+    .rec-cards::-webkit-scrollbar{height:4px}.rec-cards::-webkit-scrollbar-thumb{background:#30363d;border-radius:2px}
+    .rec-card{background:#161b22;border:1px solid #21262d;border-radius:12px;padding:13px 14px;min-width:168px;max-width:168px;cursor:pointer;transition:border-color .15s,transform .12s,box-shadow .15s;flex-shrink:0;position:relative}
+    .rec-card:hover{border-color:#58a6ff55;transform:translateY(-2px);box-shadow:0 6px 20px #58a6ff10}
+    .rc-top{display:flex;align-items:center;gap:6px;margin-bottom:4px}
+    .rc-flag{font-size:14px}
+    .rc-sym{font-size:14px;font-weight:800;color:#e6edf3;letter-spacing:.3px}
+    .rc-social{font-size:9px;background:#f0883e22;color:#f0883e;border:1px solid #f0883e44;border-radius:3px;padding:1px 4px;font-weight:700}
+    .rc-name{font-size:10px;color:#8b949e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:7px}
+    .rc-price-row{display:flex;align-items:baseline;gap:5px;margin-bottom:6px}
+    .rc-price{font-size:15px;font-weight:700;color:#e6edf3}
+    .rc-pct{font-size:11px;font-weight:600}
+    .rc-pct.up{color:#3fb950}.rc-pct.dn{color:#f85149}
+    .rc-badge{text-align:center;border-radius:6px;padding:4px 0;font-size:10px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;margin-bottom:6px}
+    .rb-sb{background:#3fb95025;color:#3fb950;border:1px solid #3fb95050}
+    .rb-b {background:#58a6ff20;color:#58a6ff;border:1px solid #58a6ff44}
+    .rb-h {background:#8b949e20;color:#8b949e;border:1px solid #8b949e44}
+    .rb-s {background:#f8514920;color:#f85149;border:1px solid #f8514944}
+    .rc-upside{font-size:11px;color:#3fb950;font-weight:600;margin-bottom:3px}
+    .rc-upside.negative{color:#f85149}
+    .rc-meta{font-size:10px;color:#8b949e}
+    .rc-add{margin-top:8px;width:100%;background:#1f6feb;color:#fff;border:none;border-radius:6px;padding:5px 0;font-size:11px;font-weight:700;cursor:pointer;transition:background .12s}
+    .rc-add:hover{background:#388bfd}
+    .rc-add.added{background:#3fb95030;color:#3fb950;border:1px solid #3fb95050;cursor:default}
+    .rec-empty{color:#8b949e;font-size:12px;padding:8px 0}
     </style>
     </head>
     <body>
@@ -709,6 +841,18 @@ data:
       </div>
     </nav>
     <div class="ticker"><div class="ticker-inner" id="ticker"></div></div>
+
+    <!-- Our Recommendation section -->
+    <div class="rec-section" id="rec-section" style="display:none">
+      <div class="rec-hdr">
+        <div class="rec-title">⭐ Our Recommendation</div>
+        <span class="rec-src" id="rec-src">📊 StockTwits + Analysts</span>
+        <span class="rec-sub" id="rec-sub">Loading…</span>
+        <button class="rec-refresh" onclick="fetchRecommendations()" title="Refresh">↺ Refresh</button>
+      </div>
+      <div class="rec-cards" id="rec-cards"><div class="rec-empty">Loading recommendations…</div></div>
+    </div>
+
     <div class="main">
 
       <!-- WATCHLIST -->
@@ -1063,7 +1207,6 @@ data:
         document.getElementById('m-ip').textContent   = d.pod_ip   || '—';
         document.getElementById('m-node').textContent = (d.node||'').replace('.ec2.internal','');
         document.getElementById('m-up').textContent   = d.uptime_s + 's';
-        document.getElementById('p-rc').textContent   = d.request_count;
       } catch(e) { /* retry next poll */ }
     }
 
@@ -1238,6 +1381,83 @@ data:
     }
 
 
+    // ── Our Recommendation section ────────────────────────────────────
+    const REC_BADGE = {
+      strong_buy: ['STRONG BUY', 'rb-sb'],
+      buy:        ['BUY',         'rb-b'],
+      hold:       ['HOLD',        'rb-h'],
+      underperform:['UNDERPERFORM','rb-s'],
+      sell:       ['SELL',        'rb-s'],
+      strong_sell:['STRONG SELL', 'rb-s'],
+    };
+
+    async function fetchRecommendations() {
+      try {
+        const r = await fetch(API + '/recommendations');
+        if (!r.ok) return;
+        const d = await r.json();
+        renderRecommendations(d.recommendations || [], d.ts);
+      } catch(e) { console.error('rec fetch:', e); }
+    }
+
+    function renderRecommendations(recs, ts) {
+      const section = document.getElementById('rec-section');
+      const cards   = document.getElementById('rec-cards');
+      const sub     = document.getElementById('rec-sub');
+      if (!recs.length) { section.style.display = 'none'; return; }
+      section.style.display = '';
+      // Update subtitle with timestamp
+      const ago = ts ? Math.round((Date.now()/1000 - ts) / 60) : 0;
+      sub.textContent = ago < 2 ? 'Just updated' : `Updated ${ago}m ago`;
+
+      const wl = new Set(Object.keys(stocks));
+      cards.innerHTML = recs.map(r => {
+        const flag   = FLAG[r.currency === 'ILS' ? 'IL' : 'US'] || '🌐';
+        const pos    = r.pct >= 0;
+        const c      = CCY_MAP[r.currency] || '$';
+        const [btxt, bcls] = REC_BADGE[r.rec] || ['HOLD', 'rb-h'];
+        const upHtml = r.upside != null
+          ? `<div class="rc-upside${r.upside < 0 ? ' negative' : ''}">
+              ${r.upside >= 0 ? '↑' : '↓'} ${Math.abs(r.upside)}% to target
+             </div>`
+          : '';
+        const socialHtml = r.social_rank
+          ? `<span class="rc-social">📊 #${r.social_rank}</span>`
+          : '';
+        const inWl   = wl.has(r.symbol);
+        const addBtn = inWl
+          ? `<button class="rc-add added" disabled>✓ In Watchlist</button>`
+          : `<button class="rc-add" onclick="event.stopPropagation();recAdd('${r.symbol}')">+ Add to Watchlist</button>`;
+        return `<div class="rec-card" onclick="recClick('${r.symbol}')">
+          <div class="rc-top">
+            <span class="rc-flag">${flag}</span>
+            <span class="rc-sym">${dispSym(r.symbol)}</span>
+            ${socialHtml}
+          </div>
+          <div class="rc-name" title="${r.name}">${r.name}</div>
+          <div class="rc-price-row">
+            <span class="rc-price">${c}${fmt(r.price)}</span>
+            <span class="rc-pct ${pos?'up':'dn'}">${pos?'+':''}${fmt(r.pct,2)}%</span>
+          </div>
+          <div class="rc-badge ${bcls}">${btxt}</div>
+          ${upHtml}
+          <div class="rc-meta">${r.analysts ? r.analysts + ' analysts' : ''} ${r.sector ? '· ' + r.sector : ''}</div>
+          ${addBtn}
+        </div>`;
+      }).join('');
+    }
+
+    async function recAdd(sym) {
+      await addStockBySymbol(sym);
+      // Re-render to update button state
+      fetchRecommendations();
+    }
+
+    function recClick(sym) {
+      if (stocks[sym]) { selectStock(sym); return; }
+      recAdd(sym);
+    }
+
     // Boot — load full catalog once for instant Popular list
     async function bootCatalog() {
       try {
@@ -1249,6 +1469,11 @@ data:
     fetchStocks();
     setInterval(fetchStocks, 8000);
     bootCatalog();
+    // Delay recommendations slightly so initial stocks load first
+    setTimeout(() => {
+      fetchRecommendations();
+      setInterval(fetchRecommendations, 5 * 60 * 1000);  // refresh every 5 min
+    }, 4000);
     </script>
     </body>
     </html>
