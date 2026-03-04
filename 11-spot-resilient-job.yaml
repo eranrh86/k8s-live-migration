@@ -1,0 +1,197 @@
+---
+# RBAC — allow job pod to read/write a checkpoint ConfigMap
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spot-job-sa
+  namespace: live-migration
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spot-job-role
+  namespace: live-migration
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "patch", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spot-job-rolebinding
+  namespace: live-migration
+subjects:
+  - kind: ServiceAccount
+    name: spot-job-sa
+    namespace: live-migration
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spot-job-role
+---
+# The Job itself — 10 minutes of work with ConfigMap checkpointing
+# backoffLimit=10 so it survives multiple Spot interruptions
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spot-resilient-job
+  namespace: live-migration
+  labels:
+    demo: spot-resilience
+spec:
+  backoffLimit: 10
+  completions: 1
+  template:
+    metadata:
+      labels:
+        app: spot-resilient-job
+        demo: spot-resilience
+    spec:
+      serviceAccountName: spot-job-sa
+      restartPolicy: OnFailure
+      containers:
+        - name: worker
+          image: python:3.11-slim
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          command:
+            - python3
+            - -c
+            - |
+              import os, time, json, ssl, urllib.request, sys
+
+              DURATION   = 600   # 10 minutes of total work
+              TICK_EVERY = 10    # print progress line every 10s
+              SAVE_EVERY = 20    # persist checkpoint every 20s
+
+              NS      = "live-migration"
+              CM_NAME = "spot-job-checkpoint"
+              K8S_API = ("https://" + os.environ.get("KUBERNETES_SERVICE_HOST","10.100.0.1")
+                         + ":" + os.environ.get("KUBERNETES_SERVICE_PORT","443"))
+              SA_TOK  = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
+
+              def sslctx():
+                  c = ssl.create_default_context()
+                  c.load_verify_locations("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+                  return c
+
+              def cm_get():
+                  """Read checkpoint from ConfigMap. Returns defaults if not found."""
+                  try:
+                      r = urllib.request.Request(
+                          f"{K8S_API}/api/v1/namespaces/{NS}/configmaps/{CM_NAME}",
+                          headers={"Authorization":"Bearer "+SA_TOK})
+                      with urllib.request.urlopen(r, context=sslctx(), timeout=5) as h:
+                          return json.loads(json.loads(h.read())["data"]["state"])
+                  except:
+                      return {"elapsed_s":0,"ticks":0,"interruptions":0,"last_node":"none"}
+
+              def cm_save(state):
+                  """Persist checkpoint — PATCH if exists, POST to create."""
+                  body = json.dumps({"data":{"state":json.dumps(state)}}).encode()
+                  try:
+                      r = urllib.request.Request(
+                          f"{K8S_API}/api/v1/namespaces/{NS}/configmaps/{CM_NAME}",
+                          data=body, method="PATCH",
+                          headers={"Authorization":"Bearer "+SA_TOK,
+                                   "Content-Type":"application/strategic-merge-patch+json"})
+                      urllib.request.urlopen(r, context=sslctx(), timeout=5)
+                      return
+                  except urllib.error.HTTPError as e:
+                      if e.code != 404:
+                          return
+                  # First run — create the ConfigMap
+                  cm = {"apiVersion":"v1","kind":"ConfigMap",
+                        "metadata":{"name":CM_NAME,"namespace":NS},
+                        "data":{"state":json.dumps(state)}}
+                  r = urllib.request.Request(
+                      f"{K8S_API}/api/v1/namespaces/{NS}/configmaps",
+                      data=json.dumps(cm).encode(), method="POST",
+                      headers={"Authorization":"Bearer "+SA_TOK,
+                               "Content-Type":"application/json"})
+                  try:
+                      urllib.request.urlopen(r, context=sslctx(), timeout=5)
+                  except:
+                      pass
+
+              # ── Startup ──────────────────────────────────────────────────
+              cp    = cm_get()
+              done  = cp["elapsed_s"]    # seconds already completed
+              ticks = cp["ticks"]        # work units done
+              intrs = cp["interruptions"] + (1 if done > 0 else 0)
+              NODE  = os.environ.get("NODE_NAME","?")
+              POD   = os.environ.get("POD_NAME","?")
+              SEP   = "=" * 66
+
+              print(f"\n{SEP}", flush=True)
+              print(f"  SPOT-RESILIENT JOB  |  Target: {DURATION}s of work", flush=True)
+              print(SEP, flush=True)
+              print(f"  Pod          : {POD}", flush=True)
+              print(f"  Node         : {NODE}", flush=True)
+              if done > 0:
+                  print(f"  ⚡ RESUMED   : {done}s already done  |  {intrs} interruption(s) survived", flush=True)
+                  print(f"  Previous node: {cp.get('last_node','?')}", flush=True)
+              else:
+                  print(f"  Fresh start  : 0s done", flush=True)
+              print(f"  Remaining    : {DURATION-done}s", flush=True)
+              print(f"{SEP}\n", flush=True)
+
+              start     = time.time()
+              last_save = -SAVE_EVERY   # save immediately on first opportunity
+              last_tick = -TICK_EVERY
+
+              # ── Main loop ─────────────────────────────────────────────────
+              while True:
+                  now   = time.time()
+                  sess  = now - start
+                  total = done + sess
+
+                  # ── Tick: print progress ──────────────────────────────────
+                  if now - (start + last_tick) >= TICK_EVERY:
+                      last_tick = sess
+                      ticks += 1
+                      if total >= DURATION:
+                          # Final checkpoint + success exit
+                          cm_save({"elapsed_s":DURATION,"ticks":ticks,
+                                   "interruptions":intrs,"last_node":NODE})
+                          bar = "█" * 30
+                          print(f"  [{int(total):4d}s] [{bar}] 100%  ✅  WORK COMPLETE!", flush=True)
+                          print(f"\n{SEP}", flush=True)
+                          print(f"  JOB COMPLETE", flush=True)
+                          print(f"  Total work time : {DURATION}s", flush=True)
+                          print(f"  Spot interruptions survived : {intrs}", flush=True)
+                          print(f"  Total ticks processed : {ticks}", flush=True)
+                          print(f"  Final node : {NODE}", flush=True)
+                          print(f"{SEP}\n", flush=True)
+                          sys.exit(0)
+                      pct    = min(int(total / DURATION * 100), 99)
+                      filled = int(pct / 100 * 30)
+                      bar    = "█" * filled + "░" * (30 - filled)
+                      rem    = int(DURATION - total)
+                      tag    = f"  ⚡ {intrs} interruption(s)" if intrs else ""
+                      short  = NODE.split(".")[0]
+                      print(f"  [{int(total):4d}s] [{bar}] {pct:2d}%  node={short}  rem={rem}s{tag}", flush=True)
+
+                  # ── Checkpoint save ───────────────────────────────────────
+                  if sess - last_save >= SAVE_EVERY:
+                      cm_save({"elapsed_s":int(total),"ticks":ticks,
+                               "interruptions":intrs,"last_node":NODE})
+                      last_save = sess
+                      print(f"  💾 checkpoint saved  elapsed={int(total)}s", flush=True)
+
+                  time.sleep(2)
