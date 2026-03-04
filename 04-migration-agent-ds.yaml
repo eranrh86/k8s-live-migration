@@ -1,0 +1,450 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: migration-agent-script
+  namespace: live-migration
+data:
+  agent.py: |
+    #!/usr/bin/env python3
+    """
+    Migration Agent — runs on every node as a privileged DaemonSet.
+    Uses 'chroot /host' to call host CRIU/crictl/runc binaries.
+
+    API:
+      POST /checkpoint?ns=NS&pod=POD&container=CTR  → run CRIU checkpoint
+      GET  /checkpoint/latest                        → return checkpoint tar (base64)
+      GET  /checkpoint/list                          → list checkpoint files
+      POST /restore                                  → restore from tar
+      GET  /health
+    """
+    import os, sys, json, base64, glob, subprocess, time, tarfile, shutil, re
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from urllib.parse import urlparse, parse_qs
+    import urllib.request, ssl
+
+    NODE_NAME = os.environ.get("NODE_NAME", "unknown")
+    CHKPT_DIR = "/var/lib/kubelet/checkpoints"  # bind-mounted from host
+    HOST_ROOT = "/host"   # host filesystem mounted here
+    PORT      = 9090
+
+    def hrun(*cmd, timeout=180, env=None):
+        """Run a command on the HOST filesystem using chroot /host"""
+        full = ["chroot", HOST_ROOT] + list(cmd)
+        return subprocess.run(full, capture_output=True, text=True,
+                               timeout=timeout, env=env)
+
+    def find_container_id(ns, pod, container):
+        """Find the container ID in the CRI namespace using host crictl."""
+        r = hrun("crictl", "ps", "--namespace", ns, "--name", container,
+                 "--output", "json")
+        if r.returncode != 0:
+            return None, f"crictl ps failed: {r.stderr[:300]}"
+        try:
+            items = json.loads(r.stdout).get("containers", [])
+        except Exception as e:
+            return None, f"parse: {e}\n{r.stdout[:200]}"
+        for c in items:
+            lbl = c.get("labels", {})
+            if (lbl.get("io.kubernetes.pod.namespace") == ns and
+                    lbl.get("io.kubernetes.container.name") == container and
+                    pod in lbl.get("io.kubernetes.pod.name", "")):
+                return c["id"], None
+        # Fallback: return first match on container name
+        for c in items:
+            if c.get("metadata", {}).get("name") == container:
+                return c["id"], None
+        return None, f"Not found {ns}/{pod}/{container}. Got: {[c.get('labels',{}).get('io.kubernetes.pod.name') for c in items]}"
+
+    def get_pid(container_id):
+        """Get host PID of container init process."""
+        r = hrun("crictl", "inspect", "--output", "json", container_id)
+        if r.returncode != 0:
+            return None, r.stderr
+        try:
+            d = json.loads(r.stdout)
+            pid = d.get("info", {}).get("pid") or d.get("status", {}).get("pid")
+            return (int(pid), None) if pid else (None, "pid not in inspect")
+        except Exception as e:
+            return None, str(e)
+
+    def get_overlay_upper(pid):
+        """Find the overlay upperdir for a container's rootfs."""
+        try:
+            with open(f"/proc/{pid}/mounts") as f:
+                for line in f:
+                    if "overlay" in line:
+                        m = re.search(r'upperdir=([^,\s]+)', line)
+                        if m:
+                            return m.group(1)
+        except Exception:
+            pass
+        return None
+
+    def do_checkpoint(ns, pod, container):
+        """
+        CRIU checkpoint of a container.
+        Primary:  kubelet checkpoint API (works if CRIU installed + feature enabled)
+        Fallback: direct criu dump via host binaries
+        Returns: (tar_path, error, method)
+        """
+        # --- Try kubelet checkpoint API first ---
+        cert = "/kubelet-pki/kubelet-client-current.pem"
+        url  = f"https://127.0.0.1:10250/checkpoint/{ns}/{pod}/{container}"
+        ctx  = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        if os.path.exists(cert):
+            ctx.load_cert_chain(cert)
+        try:
+            req = urllib.request.Request(url, method="POST")
+            with urllib.request.urlopen(req, context=ctx, timeout=120) as resp:
+                body = resp.read().decode()
+                print(f"[kubelet-api] {resp.status}: {body}", flush=True)
+                if resp.status == 200:
+                    time.sleep(3)
+                    tars = sorted(glob.glob(f"{CHKPT_DIR}/checkpoint-*.tar"), key=os.path.getmtime)
+                    if tars:
+                        return tars[-1], None, "kubelet_api"
+        except Exception as e:
+            print(f"[kubelet-api] failed: {e} — using direct CRIU", flush=True)
+
+        # --- Fallback: direct CRIU dump ---
+        cid, err = find_container_id(ns, pod, container)
+        if err:
+            return None, f"container not found: {err}", "failed"
+        pid, err = get_pid(cid)
+        if err or not pid:
+            return None, f"pid not found: {err}", "failed"
+        print(f"[criu] Container {cid[:12]}, PID={pid}", flush=True)
+
+        ts        = time.strftime("%Y-%m-%dT%H-%M-%SZ")
+        dump_dir  = f"/tmp/criu-dump-{pod}-{ts}"
+        os.makedirs(dump_dir, exist_ok=True)
+
+        # CRIU dump runs on host (via chroot), targeting the host PID
+        r = hrun("criu", "dump",
+                 "--tree", str(pid),
+                 "--images-dir", dump_dir,
+                 "--shell-job",
+                 "--leave-running",
+                 "--ext-unix-sk",
+                 "-vvv",
+                 "--log-file", f"{dump_dir}/dump.log")
+        if r.returncode != 0:
+            log = ""
+            try: log = open(f"{dump_dir}/dump.log").read()[-800:]
+            except Exception: pass
+            return None, f"criu dump rc={r.returncode}: {r.stderr[:300]}\n{log}", "failed"
+
+        print(f"[criu] dump OK in {dump_dir}", flush=True)
+
+        # Capture rootfs diff (overlay upper layer)
+        upper = get_overlay_upper(pid)
+        rootfs_tar = f"{dump_dir}/rootfs-diff.tar"
+        if upper and os.path.isdir(f"{HOST_ROOT}{upper}"):
+            r2 = subprocess.run(
+                ["tar", "-cf", rootfs_tar, "-C", f"{HOST_ROOT}{upper}", "."],
+                capture_output=True, text=True, timeout=60)
+            if r2.returncode != 0:
+                print(f"[criu] rootfs-diff warn: {r2.stderr[:200]}", flush=True)
+        else:
+            print(f"[criu] No overlay upper found for pid {pid}", flush=True)
+
+        # Capture OCI config (spec.dump / config.dump)
+        # Check containerd bundle path
+        r3 = hrun("bash", "-c",
+                  f"find /run/containerd -name config.json -path '*{cid[:12]}*' 2>/dev/null | head -1")
+        if r3.returncode == 0 and r3.stdout.strip():
+            bundle_config = r3.stdout.strip()
+            shutil.copy(f"{HOST_ROOT}{bundle_config}", f"{dump_dir}/spec.dump")
+            print(f"[criu] Captured spec from {bundle_config}", flush=True)
+
+        # Pack everything into a single tar
+        os.makedirs(CHKPT_DIR, exist_ok=True)
+        tar_path = f"{CHKPT_DIR}/checkpoint-{pod}_{ns}-{container}-{ts}.tar"
+        with tarfile.open(tar_path, "w") as tf:
+            tf.add(dump_dir, arcname="checkpoint")
+        print(f"[criu] Checkpoint tar: {tar_path} ({os.path.getsize(tar_path)} bytes)", flush=True)
+        return tar_path, None, "direct_criu"
+
+    def do_restore(tar_data, pod_name):
+        """
+        Restore from checkpoint tar using runc restore on host.
+        Uses /host/tmp/ so paths are visible to both the container and chroot'd runc.
+        Returns result dict.
+        """
+        ts          = int(time.time())
+        # Use /host/tmp so that when runc runs via 'chroot /host', it finds the bundle at /tmp/...
+        restore_dir = f"/host/tmp/restore-{pod_name}-{ts}"
+        os.makedirs(restore_dir, exist_ok=True)
+
+        # Write and extract tar
+        tar_path = f"{restore_dir}/source.tar"
+        with open(tar_path, "wb") as f:
+            f.write(tar_data)
+        with tarfile.open(tar_path, "r") as tf:
+            tf.extractall(restore_dir)
+
+        # Find CRIU image dir
+        criu_dir = None
+        for root, dirs, files in os.walk(restore_dir):
+            if "pstree.img" in files:
+                criu_dir = root
+                break
+        if not criu_dir:
+            return {"ok": False, "error": "CRIU pstree.img not found", "restore_dir": restore_dir}
+
+        # Strip /host prefix for host-relative paths passed to chroot'd runc
+        criu_dir_host = criu_dir.replace("/host/", "/", 1)
+        print(f"[restore] CRIU dir (container): {criu_dir}", flush=True)
+        print(f"[restore] CRIU dir (host path): {criu_dir_host}", flush=True)
+
+        # Build OCI bundle
+        bundle_dir      = f"{restore_dir}/bundle"
+        bundle_dir_host = bundle_dir.replace("/host/", "/", 1)
+        rootfs_dir      = f"{bundle_dir}/rootfs"
+        os.makedirs(rootfs_dir, exist_ok=True)
+
+        # Apply rootfs-diff if present in checkpoint
+        for rdiff in [f"{restore_dir}/rootfs-diff.tar",
+                      f"{os.path.dirname(criu_dir)}/rootfs-diff.tar"]:
+            if os.path.exists(rdiff):
+                subprocess.run(["tar", "-xf", rdiff, "-C", rootfs_dir], check=False)
+                print(f"[restore] rootfs-diff applied from {rdiff}", flush=True)
+                break
+
+        # Set up config.json from spec.dump if available
+        config_json = f"{bundle_dir}/config.json"
+        for src in [f"{restore_dir}/checkpoint/spec.dump",
+                    f"{restore_dir}/spec.dump",
+                    f"{os.path.dirname(criu_dir)}/spec.dump"]:
+            if os.path.exists(src):
+                with open(src) as f:
+                    cfg = json.load(f)
+                cfg.setdefault("process", {})["terminal"] = False
+                with open(config_json, "w") as f:
+                    json.dump(cfg, f)
+                print(f"[restore] config.json from {src}", flush=True)
+                break
+
+        if not os.path.exists(config_json):
+            # Generate minimal OCI config
+            minimal = {
+                "ociVersion": "1.0.0",
+                "process": {"terminal": False, "user": {"uid": 0, "gid": 0},
+                            "args": ["/bin/sh"], "cwd": "/",
+                            "capabilities": {"bounding": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"]}},
+                "root": {"path": "rootfs"},
+                "mounts": [
+                    {"destination": "/proc", "type": "proc", "source": "proc"},
+                    {"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+                     "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]},
+                ],
+                "linux": {"namespaces": [{"type": "mount"}]}
+            }
+            with open(config_json, "w") as f:
+                json.dump(minimal, f)
+            print(f"[restore] minimal config.json created", flush=True)
+
+        container_id = f"restored-{pod_name}-{ts}"
+        runc_root    = "/run/containerd/runc/k8s.io"
+
+        # runc restore on host — use host-relative paths (strip /host/ prefix)
+        print(f"[restore] runc restore: bundle={bundle_dir_host} images={criu_dir_host}", flush=True)
+        r = hrun("runc", "--root", runc_root,
+                 "restore",
+                 "--image-path", criu_dir_host,
+                 "--detach",
+                 "--bundle", bundle_dir_host,
+                 container_id)
+
+        return {
+            "ok": r.returncode == 0,
+            "container_id": container_id,
+            "restore_rc": r.returncode,
+            "restore_stdout": r.stdout[:500],
+            "restore_stderr": r.stderr[:500],
+            "criu_dir": criu_dir,
+            "bundle_dir": bundle_dir
+        }
+
+    # ── HTTP Handler ──────────────────────────────────────────────
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            print(f"[{self.address_string()}] {fmt % args}", flush=True)
+
+        def send_json(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            p = urlparse(self.path)
+            if p.path == "/health":
+                self.send_json(200, {"ok": True, "node": NODE_NAME})
+            elif p.path == "/checkpoint/list":
+                files = sorted(glob.glob(f"{CHKPT_DIR}/checkpoint-*.tar"),
+                               key=os.path.getmtime, reverse=True)
+                self.send_json(200, {"checkpoints": [
+                    {"name": os.path.basename(f), "size": os.path.getsize(f)}
+                    for f in files], "node": NODE_NAME})
+            elif p.path == "/checkpoint/latest":
+                files = sorted(glob.glob(f"{CHKPT_DIR}/checkpoint-*.tar"), key=os.path.getmtime)
+                if not files:
+                    self.send_json(404, {"error": "no checkpoints", "dir": CHKPT_DIR})
+                    return
+                path = files[-1]
+                with open(path, "rb") as f:
+                    data = f.read()
+                self.send_json(200, {
+                    "node": NODE_NAME, "name": os.path.basename(path),
+                    "size": len(data), "data_b64": base64.b64encode(data).decode()
+                })
+            else:
+                self.send_json(404, {"error": "not found"})
+
+        def do_POST(self):
+            p   = urlparse(self.path)
+            qs  = parse_qs(p.query)
+            cl  = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(cl) if cl else b"{}"
+
+            if p.path == "/checkpoint":
+                ns  = qs.get("ns",        ["default"])[0]
+                pod = qs.get("pod",        [""])[0]
+                ctr = qs.get("container",  [""])[0]
+                if not pod:
+                    self.send_json(400, {"error": "pod required"})
+                    return
+                tar_path, err, method = do_checkpoint(ns, pod, ctr)
+                if err:
+                    self.send_json(500, {"ok": False, "error": err, "node": NODE_NAME})
+                    return
+                self.send_json(200, {
+                    "ok": True, "method": method,
+                    "checkpoint_path": tar_path,
+                    "size": os.path.getsize(tar_path),
+                    "node": NODE_NAME
+                })
+
+            elif p.path == "/restore":
+                try:
+                    payload = json.loads(body)
+                except Exception:
+                    self.send_json(400, {"error": "invalid JSON"})
+                    return
+                tar_b64  = payload.get("tar_b64", "")
+                pod_name = payload.get("pod_name", f"pod-{int(time.time())}")
+                if not tar_b64:
+                    self.send_json(400, {"error": "tar_b64 required"})
+                    return
+                tar_data = base64.b64decode(tar_b64)
+                print(f"[restore] request pod={pod_name} size={len(tar_data)}", flush=True)
+                result = do_restore(tar_data, pod_name)
+                result["node"] = NODE_NAME
+                self.send_json(200 if result.get("ok") else 207, result)
+            else:
+                self.send_json(404, {"error": "not found"})
+
+    if __name__ == "__main__":
+        os.makedirs(CHKPT_DIR, exist_ok=True)
+        print(f"Migration Agent — node={NODE_NAME} port={PORT}", flush=True)
+        HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: migration-agent
+  namespace: live-migration
+  labels:
+    app: migration-agent
+spec:
+  selector:
+    matchLabels:
+      app: migration-agent
+  template:
+    metadata:
+      labels:
+        app: migration-agent
+    spec:
+      serviceAccountName: migration-agent
+      hostPID: true
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: agent
+          image: python:3.11-slim
+          command:
+            - python
+            - /agent/agent.py
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - containerPort: 9090
+              # No hostPort — hostNetwork=true means container port IS host port
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: agent-script
+              mountPath: /agent
+            - name: kubelet-pki
+              mountPath: /kubelet-pki
+              readOnly: true
+            - name: kubelet-checkpoints
+              mountPath: /var/lib/kubelet/checkpoints
+            - name: host-root
+              mountPath: /host
+            - name: containerd-sock
+              mountPath: /run/containerd/containerd.sock
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            initialDelaySeconds: 15
+            periodSeconds: 15
+      volumes:
+        - name: agent-script
+          configMap:
+            name: migration-agent-script
+        - name: kubelet-pki
+          hostPath:
+            path: /var/lib/kubelet/pki
+        - name: kubelet-checkpoints
+          hostPath:
+            path: /var/lib/kubelet/checkpoints
+            type: DirectoryOrCreate
+        - name: host-root
+          hostPath:
+            path: /
+        - name: containerd-sock
+          hostPath:
+            path: /run/containerd/containerd.sock
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: migration-agent
+  namespace: live-migration
+spec:
+  selector:
+    app: migration-agent
+  ports:
+    - port: 9090
+      targetPort: 9090
+  type: ClusterIP

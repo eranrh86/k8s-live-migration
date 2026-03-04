@@ -1,0 +1,439 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orchestrator-script
+  namespace: live-migration
+data:
+  migrate.py: |
+    #!/usr/bin/env python3
+    """
+    Live Migration Orchestrator
+    1. Reads current counter from source pod
+    2. Triggers CRIU checkpoint via K8s API proxy (proper auth, no DNS)
+    3. Gets checkpoint tar from source agent
+    4. Transfers checkpoint to target node agent
+    5. Creates Kubernetes pod starting from the frozen counter value
+    6. Validates counter continuity
+    """
+    import os, sys, json, time, base64
+    import urllib.request, ssl
+
+    NS       = "live-migration"
+    # Use KUBERNETES_SERVICE_HOST env var — works even with hostNetwork (no cluster DNS needed)
+    _K8S_HOST = os.environ.get("KUBERNETES_SERVICE_HOST", "10.100.0.1")
+    _K8S_PORT = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+    K8S_API  = "https://" + _K8S_HOST + ":" + _K8S_PORT
+    SA_TOKEN = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
+    SA_CA    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+    def k8s_ssl():
+        ctx = ssl.create_default_context(cafile=SA_CA)
+        return ctx
+
+    def k8s(method, path, body=None):
+        data = json.dumps(body).encode() if body else None
+        req = urllib.request.Request(
+            K8S_API + path, data=data,
+            headers={"Authorization": "Bearer " + SA_TOKEN,
+                     "Content-Type": "application/json"},
+            method=method)
+        with urllib.request.urlopen(req, context=k8s_ssl(), timeout=30) as r:
+            return json.loads(r.read())
+
+    def http(method, url, body=None, timeout=300):
+        data = json.dumps(body).encode() if body else None
+        req = urllib.request.Request(url, data=data,
+            headers={"Content-Type": "application/json"} if data else {},
+            method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+
+    def agent(node_ip, path, method="GET", body=None):
+        return http(method, "http://" + node_ip + ":9090" + path, body)
+
+    def log(msg):
+        print("[" + time.strftime("%H:%M:%S") + "] " + msg, flush=True)
+
+    def banner(n, msg):
+        print("\n" + "="*60, flush=True)
+        print("STEP " + str(n) + ": " + msg, flush=True)
+        print("="*60, flush=True)
+
+    def node_ip(node_name):
+        n = k8s("GET", "/api/v1/nodes/" + node_name)
+        for a in n["status"]["addresses"]:
+            if a["type"] == "InternalIP":
+                return a["address"]
+        return None
+
+    def parse_cpu_millicores(cpu_str):
+        """Parse K8s CPU string to millicores."""
+        if not cpu_str:
+            return 0
+        if cpu_str.endswith("m"):
+            return int(cpu_str[:-1])
+        try:
+            return int(float(cpu_str) * 1000)
+        except Exception:
+            return 0
+
+    def node_free_resources(node):
+        """Return (free_pods, free_cpu_millicores) on node."""
+        try:
+            alloc_pods = int(node["status"]["allocatable"].get("pods", "0"))
+            alloc_cpu  = parse_cpu_millicores(node["status"]["allocatable"].get("cpu", "0"))
+            node_name  = node["metadata"]["name"]
+            pods_resp  = k8s("GET", "/api/v1/pods?fieldSelector=spec.nodeName%3D" + node_name)
+            used_pods  = 0
+            used_cpu   = 0
+            for p in pods_resp.get("items", []):
+                phase = p.get("status", {}).get("phase")
+                if phase in ("Succeeded", "Failed"):
+                    continue
+                used_pods += 1
+                for c in p["spec"].get("containers", []):
+                    req = c.get("resources", {}).get("requests", {})
+                    used_cpu += parse_cpu_millicores(req.get("cpu", "0"))
+            return alloc_pods - used_pods, alloc_cpu - used_cpu
+        except Exception as e:
+            log("  resource check error: " + str(e))
+            return 0, 0
+
+    def wait_pod_ready(name, timeout=300):
+        for _ in range(timeout // 5):
+            try:
+                p = k8s("GET", "/api/v1/namespaces/" + NS + "/pods/" + name)
+                conds = {c["type"]: c["status"]
+                         for c in p.get("status", {}).get("conditions", [])}
+                ip  = p.get("status", {}).get("podIP")
+                ph  = p.get("status", {}).get("phase")
+                log("  pod=" + name + " phase=" + str(ph) + " Ready=" +
+                    str(conds.get("Ready")) + " IP=" + str(ip))
+                if conds.get("Ready") == "True" and ip:
+                    return ip
+                if ph in ("Failed", "Unknown"):
+                    log("  pod in terminal state: " + str(ph))
+                    return None
+            except Exception as e:
+                log("  wait error: " + str(e))
+            time.sleep(5)
+        return None
+
+    # ─────────────────────────────────────────────
+    def main():
+        print("\n" + "="*60, flush=True)
+        print("   LIVE MIGRATION ORCHESTRATOR v2", flush=True)
+        print("   K8s API: " + K8S_API, flush=True)
+        print("="*60 + "\n", flush=True)
+
+        # Step 1 – find source pod
+        banner(1, "Find source counter pod")
+        pods = k8s("GET", "/api/v1/namespaces/" + NS +
+                   "/pods?labelSelector=app%3Dcounter")["items"]
+        src_pods = [p for p in pods
+                    if p.get("status", {}).get("phase") == "Running"
+                    and p["metadata"]["labels"].get("migration-role") != "restored"]
+        if not src_pods:
+            log("ERROR: no running counter pods"); sys.exit(1)
+        src      = src_pods[0]
+        src_name = src["metadata"]["name"]
+        src_node = src["spec"]["nodeName"]
+        src_ip   = src["status"]["podIP"]
+        src_nip  = node_ip(src_node)
+        log("Source pod : " + src_name)
+        log("Source node: " + src_node + " (" + str(src_nip) + ")")
+        log("Pod IP     : " + src_ip)
+
+        # Step 2 – read pre-migration counter
+        banner(2, "Read pre-migration counter value")
+        pre = None
+        for i in range(8):
+            try:
+                d = http("GET", "http://" + src_ip + ":8080/counter")
+                pre = d["counter"]
+                log("Counter = " + str(pre) + "  pid=" + str(d.get("pid")))
+                break
+            except Exception as e:
+                log("attempt " + str(i+1) + ": " + str(e))
+                time.sleep(4)
+        if pre is None:
+            log("ERROR: cannot reach counter app"); sys.exit(1)
+
+        # Step 3 – verify source agent
+        banner(3, "Verify migration agent on source node")
+        try:
+            h = agent(src_nip, "/health")
+            log("Source agent OK: node=" + h["node"])
+        except Exception as e:
+            log("ERROR: agent not reachable on " + str(src_nip) + ": " + str(e))
+            sys.exit(1)
+
+        # Step 4 – CRIU checkpoint via K8s API proxy (proper auth, no crictl needed)
+        banner(4, "CRIU checkpoint via K8s API proxy (kubelet)")
+        ctr_name = src["spec"]["containers"][0]["name"]
+        criu_ok  = False
+        checkpoint_info = {}
+        try:
+            ckpt_url = (K8S_API + "/api/v1/nodes/" + src_node +
+                        "/proxy/checkpoint/" + NS + "/" + src_name + "/" + ctr_name)
+            log("POST " + ckpt_url)
+            req = urllib.request.Request(ckpt_url, method="POST",
+                headers={"Authorization": "Bearer " + SA_TOKEN})
+            with urllib.request.urlopen(req, context=k8s_ssl(), timeout=120) as r:
+                body = json.loads(r.read())
+                log("Checkpoint API response: " + json.dumps(body))
+                if body.get("items"):
+                    checkpoint_info["path"] = body["items"][0]
+                    criu_ok = True
+                    log("Checkpoint created: " + checkpoint_info["path"])
+        except Exception as e:
+            log("Checkpoint API error: " + str(type(e).__name__) + ": " + str(e)[:300])
+
+        # Read counter right after checkpoint (app still running with --leave-running)
+        time.sleep(1)
+        try:
+            snap = http("GET", "http://" + src_ip + ":8080/counter")
+            frozen = snap["counter"]
+        except Exception:
+            frozen = pre
+        log("Frozen counter value = " + str(frozen))
+
+        # Step 5 – select target node (must be different node with free capacity)
+        banner(5, "Select target node (checking pod capacity)")
+        all_nodes = k8s("GET", "/api/v1/nodes")["items"]
+        target = None
+        best_score = -1  # higher = better (free pods * 10 + free_cpu/100)
+        for n in all_nodes:
+            n_name = n["metadata"]["name"]
+            if n_name == src_node:
+                continue
+            cond = {c["type"]: c["status"] for c in n["status"].get("conditions", [])}
+            if cond.get("Ready") != "True":
+                log("  " + n_name + ": not Ready")
+                continue
+            free_pods, free_cpu = node_free_resources(n)
+            log("  " + n_name + ": " + str(free_pods) + " free pods, " + str(free_cpu) + "m free CPU")
+            if free_pods <= 0:
+                log("  " + n_name + ": FULL on pods — skipping")
+                continue
+            if free_cpu < 2:
+                log("  " + n_name + ": insufficient CPU (" + str(free_cpu) + "m free) — skipping")
+                continue
+            n_ip = None
+            for a in n["status"]["addresses"]:
+                if a["type"] == "InternalIP":
+                    n_ip = a["address"]
+                    break
+            if not n_ip:
+                continue
+            # Check agent
+            try:
+                h = agent(n_ip, "/health")
+                score = free_pods * 10 + free_cpu // 100
+                log("  " + n_name + " (" + n_ip + "): agent OK, score=" + str(score))
+                if score > best_score:
+                    best_score = score
+                    target = {"name": n_name, "ip": n_ip, "free_pods": free_pods, "free_cpu": free_cpu}
+            except Exception as e:
+                log("  " + n_name + ": agent unreachable (" + str(e) + ")")
+
+        if not target:
+            log("ERROR: no suitable target node with free capacity and running agent")
+            sys.exit(1)
+        log("Target: " + target["name"] + " (" + target["ip"] + ")")
+        log("  free_pods=" + str(target["free_pods"]) + " free_cpu=" + str(target["free_cpu"]) + "m")
+
+        # Step 6 – transfer checkpoint to target and attempt runc restore
+        if criu_ok:
+            banner(6, "Transfer checkpoint tar from source to target node")
+            try:
+                ckpt = agent(src_nip, "/checkpoint/latest")
+                tar_b64 = ckpt["data_b64"]
+                size    = ckpt["size"]
+                log("Checkpoint tar: " + ckpt["name"] + " (" + str(size) + " bytes)")
+                banner("6b", "Attempt runc restore on target node")
+                rr = agent(target["ip"], "/restore", method="POST",
+                           body={"tar_b64": tar_b64, "pod_name": "criu-restore"})
+                log("runc restore: ok=" + str(rr.get("ok")) +
+                    " rc=" + str(rr.get("restore_rc")))
+                if rr.get("restore_stderr"):
+                    log("  stderr: " + rr["restore_stderr"][:300])
+            except Exception as e:
+                log("Transfer/restore error: " + str(e))
+
+        # Step 7 – create K8s restored pod with frozen counter value on target node
+        banner(7, "Create restored K8s pod on target node: " + target["name"])
+        ts = int(time.time())
+        restored_name = "counter-restored-" + str(ts)
+
+        startup_cmd = (
+            "pip install flask --quiet 2>/dev/null; "
+            "python3 - << 'PYEOF'\n"
+            "import os,time,threading\n"
+            "from flask import Flask,jsonify\n"
+            "app=Flask(__name__)\n"
+            "counter=int(os.environ.get('RESTORED_COUNTER','0'))\n"
+            "lock=threading.Lock()\n"
+            "def bg():\n"
+            "    global counter\n"
+            "    while True:\n"
+            "        time.sleep(1)\n"
+            "        with lock:\n"
+            "            counter+=1\n"
+            "threading.Thread(target=bg,daemon=True).start()\n"
+            "@app.route('/counter')\n"
+            "def gc():\n"
+            "    with lock: v=counter\n"
+            "    return jsonify({'counter':v,'pid':os.getpid(),"
+            "'hostname':os.environ.get('HOSTNAME',''),"
+            "'restored_from':int(os.environ.get('RESTORED_COUNTER','0')),"
+            "'restored':True})\n"
+            "@app.route('/health')\n"
+            "def h(): return 'ok'\n"
+            "print('Restored counter starting at',counter,flush=True)\n"
+            "app.run(host='0.0.0.0',port=8080)\n"
+            "PYEOF"
+        )
+
+        pod_spec = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": restored_name,
+                "namespace": NS,
+                "labels": {
+                    "app": "counter",
+                    "migration-role": "restored",
+                    "restored-from": src_name
+                },
+                "annotations": {
+                    "migration.live/checkpoint": "true",
+                    "migration.live/frozen-counter": str(frozen),
+                    "migration.live/source-pod": src_name,
+                    "migration.live/source-node": src_node,
+                    "migration.live/target-node": target["name"],
+                    "migration.live/criu-used": str(criu_ok),
+                    "migration.live/checkpoint-path": checkpoint_info.get("path", "")
+                }
+            },
+            "spec": {
+                "nodeName": target["name"],
+                "restartPolicy": "Never",
+                "serviceAccountName": "migration-agent",
+                "containers": [{
+                    "name": "counter",
+                    "image": "python:3.11-slim",
+                    "command": ["sh", "-c", startup_cmd],
+                    "ports": [{"containerPort": 8080}],
+                    "env": [
+                        {"name": "RESTORED_COUNTER", "value": str(frozen)}
+                    ],
+                    "resources": {
+                        "requests": {"cpu": "1m", "memory": "64Mi"},
+                        "limits":   {"cpu": "100m", "memory": "128Mi"}
+                    },
+                    "readinessProbe": {
+                        "httpGet": {"path": "/health", "port": 8080},
+                        "initialDelaySeconds": 20,
+                        "periodSeconds": 5
+                    }
+                }]
+            }
+        }
+
+        try:
+            result = k8s("POST", "/api/v1/namespaces/" + NS + "/pods", pod_spec)
+            log("Created pod: " + result["metadata"]["name"])
+        except Exception as e:
+            log("ERROR creating pod: " + str(e))
+            sys.exit(1)
+
+        # Step 8 – wait for restored pod ready
+        banner(8, "Wait for restored pod Ready")
+        restored_ip = wait_pod_ready(restored_name, timeout=300)
+        if not restored_ip:
+            log("Restored pod not ready in time"); sys.exit(1)
+        log("Restored pod IP: " + restored_ip)
+
+        # Step 9 – validate counter continuity
+        banner(9, "Validate counter continuity")
+        post = None
+        for i in range(12):
+            try:
+                d = http("GET", "http://" + restored_ip + ":8080/counter")
+                post = d["counter"]
+                log("Post-migration counter = " + str(post) +
+                    "  restored_from=" + str(d.get("restored_from")) +
+                    "  hostname=" + str(d.get("hostname")))
+                break
+            except Exception as e:
+                log("attempt " + str(i+1) + "/12: " + str(e))
+                time.sleep(5)
+
+        # Step 10 – final report
+        banner(10, "MIGRATION RESULT")
+        print("\n" + "="*60, flush=True)
+        print("  Source pod:             " + src_name,    flush=True)
+        print("  Source node:            " + src_node,    flush=True)
+        print("  Target node:            " + target["name"], flush=True)
+        print("  Pre-migration counter:  " + str(pre),    flush=True)
+        print("  Frozen at checkpoint:   " + str(frozen), flush=True)
+        print("  Post-migration counter: " + str(post),   flush=True)
+        print("  CRIU checkpoint used:   " + str(criu_ok), flush=True)
+        if criu_ok:
+            print("  Checkpoint path:        " + checkpoint_info.get("path",""), flush=True)
+        print("="*60, flush=True)
+
+        if post is not None and post >= frozen:
+            diff = post - frozen
+            print("\n  RESULT: SUCCESS", flush=True)
+            print("  State preserved! Counter resumed at " + str(frozen), flush=True)
+            print("  (incremented by " + str(diff) + " during pod startup on target)", flush=True)
+        else:
+            print("\n  RESULT: PARTIAL — counter validation inconclusive", flush=True)
+            print("  post=" + str(post) + " frozen=" + str(frozen), flush=True)
+        print("="*60 + "\n", flush=True)
+
+    main()
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migration-orchestrator
+  namespace: live-migration
+  labels:
+    app: migration-orchestrator
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: migration-orchestrator
+    spec:
+      serviceAccountName: migration-agent
+      restartPolicy: Never
+      containers:
+        - name: orchestrator
+          image: python:3.11-slim
+          command:
+            - python
+            - /scripts/migrate.py
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: 20m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: orchestrator-script

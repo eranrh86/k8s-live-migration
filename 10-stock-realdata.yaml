@@ -1,0 +1,824 @@
+---
+# Backend ConfigMap — Python app using yfinance for real market data
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stock-backend-config
+  namespace: stock-app
+data:
+  app.py: |
+    import os, time, threading, random
+    from flask import Flask, jsonify, request
+    from flask_cors import CORS
+
+    app = Flask(__name__)
+    CORS(app)
+
+    # Migratable state (seeded from env vars on CRIU restore)
+    request_count = int(os.environ.get("RESTORED_RC", "0"))
+    trade_count   = int(os.environ.get("RESTORED_TC", "0"))
+    pnl_total     = float(os.environ.get("RESTORED_PNL", "0.0"))
+    start_time    = time.time()
+    state_lock    = threading.Lock()
+
+    # Mutable stock list
+    DEFAULTS    = ["AAPL", "TSLA", "NVDA", "AMZN", "MSFT", "GOOG", "META", "JPM"]
+    stocks      = list(DEFAULTS)
+    stocks_lock = threading.Lock()
+
+    # Data caches (refreshed in background)
+    price_cache = {}   # sym -> {price, change, pct, ma50, ma100, ma200, volume, chart, _ts}
+    fund_cache  = {}   # sym -> {fundamentals}
+    data_lock   = threading.Lock()
+    loading_set = set()
+
+    def load_stock(sym):
+        """Fetch 1yr history via yfinance, compute MAs and fundamentals."""
+        global loading_set
+        with data_lock:
+            if sym in loading_set:
+                return
+            loading_set.add(sym)
+        try:
+            import yfinance as yf
+            import pandas as pd
+            t    = yf.Ticker(sym)
+            hist = t.history(period="1y", auto_adjust=True)
+            if hist.empty or len(hist) < 5:
+                print(f"{sym}: no history", flush=True)
+                return
+            closes = hist["Close"]
+            cur    = float(closes.iloc[-1])
+            prev   = float(closes.iloc[-2]) if len(closes) > 1 else cur
+            chg    = cur - prev
+            pct    = (chg / prev * 100) if prev else 0.0
+            def ma(w):
+                v = closes.rolling(w).mean().iloc[-1]
+                return round(float(v), 2) if not pd.isna(v) and len(closes) >= w else None
+            ma50  = ma(50)
+            ma100 = ma(100)
+            ma200 = ma(200)
+            N = min(120, len(hist))
+            def rolling_series(w):
+                r = closes.rolling(w).mean().iloc[-N:]
+                return [None if pd.isna(v) else round(float(v), 2) for v in r]
+            chart = {
+                "dates":  [d.strftime("%Y-%m-%d") for d in hist.index[-N:]],
+                "closes": [round(float(v), 2) for v in closes.iloc[-N:]],
+                "ma50":   rolling_series(50),
+                "ma100":  rolling_series(100),
+                "ma200":  rolling_series(200),
+            }
+            # Fundamentals
+            try:
+                info = t.info
+            except Exception:
+                info = {}
+            def fmt_cap(v):
+                if not v: return None
+                if v >= 1e12: return f"${v/1e12:.2f}T"
+                if v >= 1e9:  return f"${v/1e9:.2f}B"
+                if v >= 1e6:  return f"${v/1e6:.2f}M"
+                return f"${v:,.0f}"
+            fund = {
+                "name":          info.get("longName", sym),
+                "sector":        info.get("sector", "—"),
+                "industry":      info.get("industry", "—"),
+                "market_cap":    fmt_cap(info.get("marketCap")),
+                "market_cap_raw":info.get("marketCap"),
+                "trailing_pe":   round(float(info["trailingPE"]), 2) if info.get("trailingPE") else None,
+                "forward_pe":    round(float(info["forwardPE"]), 2) if info.get("forwardPE") else None,
+                "eps":           info.get("trailingEps"),
+                "div_yield":     round(float(info["dividendYield"]), 4) if info.get("dividendYield") else None,
+                "high_52w":      info.get("fiftyTwoWeekHigh"),
+                "low_52w":       info.get("fiftyTwoWeekLow"),
+                "avg_vol":       info.get("averageVolume"),
+                "beta":          round(float(info["beta"]), 2) if info.get("beta") else None,
+                "pb":            round(float(info["priceToBook"]), 2) if info.get("priceToBook") else None,
+                "profit_margin": round(float(info["profitMargins"]) * 100, 1) if info.get("profitMargins") else None,
+                "revenue_growth":round(float(info["revenueGrowth"]) * 100, 1) if info.get("revenueGrowth") else None,
+                "description":   (info.get("longBusinessSummary") or "")[:300],
+                "currency":      info.get("currency", "USD"),
+            }
+            raw_ccy = info.get("currency", "USD")
+            # yfinance quotes some TASE stocks in ILA (Israeli Agoroth = 1/100 ILS)
+            # Convert to ILS for human-readable display
+            if raw_ccy == "ILA":
+                factor = 0.01
+                display_ccy = "ILS"
+            else:
+                factor = 1.0
+                display_ccy = raw_ccy
+            def rescale(v): return round(v * factor, 2) if v else v
+            entry = {
+                "price":    rescale(cur), "change": rescale(chg), "pct": round(pct, 2),
+                "ma50":     rescale(ma50), "ma100": rescale(ma100), "ma200": rescale(ma200),
+                "volume":   int(hist["Volume"].iloc[-1]),
+                "name":     fund["name"], "sector": fund["sector"],
+                "currency": display_ccy,
+                "chart":    chart, "_ts": time.time(),
+            }
+            with data_lock:
+                price_cache[sym] = entry
+                fund_cache[sym]  = fund
+            print(f"Loaded {sym}: ${round(cur,2)}  50MA={ma50}  100MA={ma100}  200MA={ma200}", flush=True)
+        except Exception as e:
+            print(f"load_stock({sym}) ERROR: {e}", flush=True)
+        finally:
+            with data_lock:
+                loading_set.discard(sym)
+
+    def refresh_loop():
+        while True:
+            with stocks_lock:
+                syms = list(stocks)
+            for sym in syms:
+                with data_lock:
+                    age = time.time() - price_cache.get(sym, {}).get("_ts", 0)
+                if age > 300:      # refresh every 5 minutes
+                    threading.Thread(target=load_stock, args=(sym,), daemon=True).start()
+            time.sleep(60)
+
+    def initial_load():
+        with stocks_lock:
+            syms = list(stocks)
+        threads = [threading.Thread(target=load_stock, args=(s,), daemon=True) for s in syms]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        print(f"All {len(syms)} stocks loaded.", flush=True)
+
+    threading.Thread(target=initial_load, daemon=True).start()
+    threading.Thread(target=refresh_loop, daemon=True).start()
+
+    @app.route("/health")
+    def health():
+        return "ok"
+
+    @app.route("/api/stocks")
+    def get_stocks():
+        global request_count
+        with state_lock:
+            request_count += 1
+            rc = request_count
+        with data_lock:
+            result = []
+            for sym in stocks:
+                d = price_cache.get(sym)
+                if d:
+                    result.append({
+                        "symbol": sym, "name": d.get("name", sym),
+                        "price": d["price"], "change": d["change"], "pct": d["pct"],
+                        "ma50": d.get("ma50"), "ma100": d.get("ma100"), "ma200": d.get("ma200"),
+                        "volume": d.get("volume", 0), "sector": d.get("sector", ""),
+                        "currency": d.get("currency", "USD"),
+                        "age_s": int(time.time() - d.get("_ts", 0)),
+                    })
+                else:
+                    result.append({"symbol": sym, "loading": True})
+        return jsonify({
+            "stocks": result, "request_count": rc,
+            "uptime_s": round(time.time() - start_time, 1),
+            "pod_ip": os.environ.get("POD_IP", ""),
+            "node": os.environ.get("NODE_NAME", ""),
+            "hostname": os.environ.get("HOSTNAME", ""),
+            "pid": os.getpid(),
+        })
+
+    @app.route("/api/stock/<symbol>")
+    def get_stock_detail(symbol):
+        symbol = symbol.upper()
+        with data_lock:
+            d = price_cache.get(symbol)
+            f = fund_cache.get(symbol, {})
+        if not d:
+            return jsonify({"error": "not found or still loading"}), 404
+        return jsonify({"symbol": symbol, **d, "fundamentals": f})
+
+    @app.route("/api/stocks/add", methods=["POST"])
+    def add_stock():
+        sym = ((request.json or {}).get("symbol") or "").upper().strip()
+        if not sym:
+            return jsonify({"error": "symbol required"}), 400
+        with stocks_lock:
+            if sym in stocks:
+                return jsonify({"status": "exists", "symbol": sym})
+            stocks.append(sym)
+        # Load synchronously in a short-timeout thread and validate
+        result = {"ok": False}
+        def load_and_check():
+            load_stock(sym)
+            with data_lock:
+                result["ok"] = sym in price_cache
+        t = threading.Thread(target=load_and_check, daemon=True)
+        t.start()
+        t.join(timeout=30)  # wait up to 30s for yfinance
+        if not result["ok"]:
+            with stocks_lock:
+                if sym in stocks: stocks.remove(sym)
+            with data_lock:
+                price_cache.pop(sym, None); fund_cache.pop(sym, None)
+            return jsonify({"status": "error", "symbol": sym, "error": "Symbol not found or no data available"}), 404
+        return jsonify({"status": "ok", "symbol": sym})
+
+    @app.route("/api/stocks/<symbol>", methods=["DELETE"])
+    def remove_stock(symbol):
+        symbol = symbol.upper()
+        with stocks_lock:
+            if symbol in stocks:
+                stocks.remove(symbol)
+        with data_lock:
+            price_cache.pop(symbol, None)
+            fund_cache.pop(symbol, None)
+        return jsonify({"status": "removed", "symbol": symbol})
+
+    @app.route("/api/status")
+    def status():
+        with state_lock:
+            rc = request_count; tc = trade_count; pnl = pnl_total
+        return jsonify({
+            "request_count": rc, "trade_count": tc, "pnl_total": round(pnl, 2),
+            "uptime_s": round(time.time() - start_time, 1),
+            "pod_ip": os.environ.get("POD_IP", ""),
+            "node": os.environ.get("NODE_NAME", ""),
+            "hostname": os.environ.get("HOSTNAME", ""),
+            "pid": os.getpid(),
+        })
+
+    @app.route("/api/trade", methods=["POST"])
+    def trade():
+        global trade_count, pnl_total
+        body  = request.json or {}
+        qty   = int(body.get("qty", 10))
+        sym   = body.get("symbol", "AAPL").upper()
+        with data_lock:
+            p = price_cache.get(sym, {}).get("price", 100.0)
+        gain = random.uniform(-0.04, 0.06) * p * qty
+        with state_lock:
+            trade_count += 1
+            pnl_total   += gain
+            tc = trade_count; pnl = pnl_total
+        return jsonify({"trades": tc, "pnl": round(pnl, 2), "gain": round(gain, 2)})
+
+    print(f"Stock backend v2 (yfinance) | pid={os.getpid()} | node={os.environ.get('NODE_NAME','')} | ip={os.environ.get('POD_IP','')}", flush=True)
+    app.run(host="0.0.0.0", port=8080, threaded=True)
+---
+# Updated Frontend — Chart.js price chart with MA lines, fundamentals panel, add-stock
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stock-frontend-html
+  namespace: stock-app
+data:
+  nginx.conf: |
+    server {
+      listen 80;
+      root /usr/share/nginx/html;
+      index index.html;
+      location /api/ {
+        proxy_pass http://10.100.162.45:8080/api/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 60;
+        proxy_http_version 1.1;
+      }
+      location / { try_files $uri $uri/ /index.html; }
+    }
+
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>TraderPro — Live Market Data</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+    /* NAV */
+    nav{background:#161b22;border-bottom:1px solid #30363d;height:52px;display:flex;align-items:center;padding:0 16px;gap:12px;flex-shrink:0;z-index:10}
+    .logo{font-size:18px;font-weight:700;color:#58a6ff;letter-spacing:-.5px;white-space:nowrap}.logo span{color:#3fb950}
+    .add-form{display:flex;gap:6px;flex:1;max-width:340px}
+    .add-input{background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:6px 10px;border-radius:6px;font-size:13px;width:100px;text-transform:uppercase}
+    .add-input:focus{outline:none;border-color:#58a6ff}
+    .add-input::placeholder{text-transform:none;color:#8b949e}
+    .btn-add{background:#1f6feb;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
+    .btn-add:hover{background:#388bfd}
+    .exchange-toggle{display:flex;border:1px solid #30363d;border-radius:6px;overflow:hidden;flex-shrink:0}
+    .exc-btn{background:#21262d;color:#8b949e;border:none;padding:5px 9px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;transition:all .15s}
+    .exc-btn.active{background:#1f6feb;color:#fff}
+    .exc-btn:hover:not(.active){background:#30363d;color:#e6edf3}
+    .tase-badge{font-size:9px;background:#1f6feb22;color:#58a6ff;border:1px solid #1f6feb44;border-radius:3px;padding:0 3px;margin-left:3px;vertical-align:middle;font-weight:700}
+    .nav-right{display:flex;align-items:center;gap:10px;margin-left:auto}
+    .clock{color:#8b949e;font-size:12px;font-variant-numeric:tabular-nums}
+    .bal-box{background:#3fb95015;border:1px solid #3fb95044;border-radius:6px;padding:4px 12px;text-align:center}
+    .bal-label{font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px}
+    .bal-val{font-size:15px;font-weight:700;color:#3fb950}
+    /* TICKER */
+    .ticker{background:#0d1117;border-bottom:1px solid #21262d;height:28px;overflow:hidden;white-space:nowrap;flex-shrink:0}
+    .ticker-inner{display:inline-flex;animation:scroll 50s linear infinite}
+    .tick-item{display:inline-flex;align-items:center;gap:6px;margin:0 20px;font-size:11px;font-weight:600;line-height:28px}
+    .tick-p{color:#3fb950}.tick-n{color:#f85149}
+    @keyframes scroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
+    /* MAIN */
+    .main{display:flex;flex:1;overflow:hidden}
+    /* WATCHLIST */
+    .watchlist{width:520px;border-right:1px solid #21262d;display:flex;flex-direction:column;flex-shrink:0}
+    .wl-header{background:#161b22;border-bottom:1px solid #21262d;padding:0 8px;flex-shrink:0}
+    .wl-cols{display:grid;grid-template-columns:62px 1fr 76px 60px 72px 72px 72px 28px;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;padding:6px 4px;font-weight:600}
+    .wl-cols span{text-align:right}.wl-cols span:first-child,.wl-cols span:nth-child(2){text-align:left}
+    .wl-body{overflow-y:auto;flex:1}
+    .wl-row{display:grid;grid-template-columns:62px 1fr 76px 60px 72px 72px 72px 28px;align-items:center;padding:7px 4px;border-bottom:1px solid #21262d0a;cursor:pointer;transition:background .1s}
+    .wl-row:hover{background:#161b2280}
+    .wl-row.active{background:#1f6feb15;border-left:2px solid #58a6ff}
+    .sym{font-size:13px;font-weight:700}
+    .sname{font-size:10px;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .price{font-size:13px;font-weight:600;text-align:right;font-variant-numeric:tabular-nums}
+    .chg{font-size:11px;font-weight:600;text-align:right;padding:2px 5px;border-radius:3px}
+    .pos{color:#3fb950;background:#3fb95015}.neg{color:#f85149;background:#f8514915}
+    .ma-cell{text-align:right;font-size:10px}
+    .ma-val{font-variant-numeric:tabular-nums;color:#8b949e}
+    .ma-ind{font-size:9px;font-weight:700;padding:1px 3px;border-radius:3px;margin-left:2px}
+    .ma-up{color:#3fb950;background:#3fb95020}.ma-dn{color:#f85149;background:#f8514920}.ma-eq{color:#8b949e}
+    .del-btn{cursor:pointer;color:#8b949e;font-size:14px;text-align:center;border-radius:4px;transition:all .1s}
+    .del-btn:hover{color:#f85149;background:#f8514915}
+    .loading-row{padding:10px 12px;color:#8b949e;font-size:12px;font-style:italic}
+    /* CENTER */
+    .chart-area{flex:1;display:flex;flex-direction:column;overflow:hidden;border-right:1px solid #21262d}
+    .chart-header{background:#161b22;border-bottom:1px solid #21262d;padding:10px 16px;flex-shrink:0}
+    .ch-name{font-size:11px;color:#8b949e;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+    .ch-price{font-size:28px;font-weight:700;color:#e6edf3;font-variant-numeric:tabular-nums}
+    .ch-chg{font-size:13px;font-weight:600;padding:2px 8px;border-radius:5px;margin-left:8px}
+    .ch-ma-legend{display:flex;gap:16px;margin-top:6px}
+    .ch-ma-item{display:flex;align-items:center;gap:5px;font-size:11px;color:#8b949e}
+    .ch-ma-dot{width:12px;height:3px;border-radius:2px}
+    .chart-wrap{flex:1;padding:12px 16px;position:relative;min-height:0}
+    .chart-empty{display:flex;align-items:center;justify-content:center;color:#8b949e;font-size:14px;height:100%}
+    /* RIGHT PANEL */
+    .detail-panel{width:280px;display:flex;flex-direction:column;overflow-y:auto;flex-shrink:0}
+    .dp-section{padding:12px 14px;border-bottom:1px solid #21262d}
+    .dp-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#8b949e;margin-bottom:10px}
+    .fund-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+    .fund-box{background:#161b22;border:1px solid #21262d;border-radius:6px;padding:7px 9px}
+    .fund-label{font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.3px}
+    .fund-val{font-size:13px;font-weight:600;color:#e6edf3;margin-top:2px;font-variant-numeric:tabular-nums}
+    .fund-val.green{color:#3fb950}.fund-val.red{color:#f85149}.fund-val.blue{color:#58a6ff}
+    .sector-badge{display:inline-block;background:#1f6feb20;border:1px solid #1f6feb44;color:#58a6ff;border-radius:12px;padding:3px 10px;font-size:11px;font-weight:600;margin-top:4px}
+    .desc{font-size:11px;color:#8b949e;line-height:1.5;margin-top:6px}
+    /* TRADE */
+    .qty-row{display:flex;gap:6px;align-items:center;margin-bottom:8px}
+    .qty-label{font-size:11px;color:#8b949e;width:50px}
+    .qty-input{flex:1;background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:5px 8px;border-radius:5px;font-size:13px}
+    .trade-btns{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+    .btn-buy{background:#3fb950;color:#fff;border:none;border-radius:6px;padding:9px;font-size:13px;font-weight:700;cursor:pointer}
+    .btn-sell{background:#f85149;color:#fff;border:none;border-radius:6px;padding:9px;font-size:13px;font-weight:700;cursor:pointer}
+    .btn-buy:hover{opacity:.85}.btn-sell:hover{opacity:.85}
+    .trade-msg{font-size:11px;color:#8b949e;text-align:center;margin-top:5px;min-height:16px}
+    /* PNL */
+    .pnl-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+    .pnl-box{background:#161b22;border:1px solid #21262d;border-radius:6px;padding:8px 10px}
+    .pnl-label{font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.3px}
+    .pnl-val{font-size:14px;font-weight:700;margin-top:2px;font-variant-numeric:tabular-nums}
+    /* MIG STATUS */
+    .mig-row{display:flex;justify-content:space-between;padding:4px 0;font-size:11px;border-bottom:1px solid #21262d0a}
+    .mig-key{color:#8b949e}.mig-val{color:#58a6ff;font-family:monospace;font-size:10px}
+    .live-dot{width:7px;height:7px;border-radius:50%;background:#3fb950;box-shadow:0 0 6px #3fb950;display:inline-block;margin-right:5px;animation:pulse 2s infinite}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+    </style>
+    </head>
+    <body>
+    <nav>
+      <div class="logo">Trader<span>Pro</span></div>
+      <div class="add-form">
+        <div class="exchange-toggle">
+          <button class="exc-btn active" id="exc-nasdaq" onclick="setExch('NASDAQ')">NASDAQ</button>
+          <button class="exc-btn" id="exc-tase" onclick="setExch('TASE')">🇮🇱 TASE</button>
+        </div>
+        <input class="add-input" id="add-sym" placeholder="AAPL, TSLA…" maxlength="12">
+        <button class="btn-add" onclick="addStock()">+ Add</button>
+      </div>
+      <div class="nav-right">
+        <div class="clock" id="clock">00:00:00</div>
+        <div class="bal-box"><div class="bal-label">Equity</div><div class="bal-val" id="nav-bal">$125,000</div></div>
+      </div>
+    </nav>
+    <div class="ticker"><div class="ticker-inner" id="ticker"></div></div>
+    <div class="main">
+
+      <!-- WATCHLIST -->
+      <div class="watchlist">
+        <div class="wl-header">
+          <div class="wl-cols">
+            <span>Symbol</span><span>Name</span>
+            <span>Price</span><span>Chg%</span>
+            <span>MA 50</span><span>MA 100</span><span>MA 200</span>
+            <span></span>
+          </div>
+        </div>
+        <div class="wl-body" id="wl-body"></div>
+      </div>
+
+      <!-- CHART -->
+      <div class="chart-area">
+        <div class="chart-header">
+          <div class="ch-name" id="ch-sym">Select a stock</div>
+          <div style="display:flex;align-items:baseline">
+            <div class="ch-price" id="ch-price">—</div>
+            <div class="ch-chg" id="ch-chg"></div>
+          </div>
+          <div class="ch-ma-legend">
+            <div class="ch-ma-item"><div class="ch-ma-dot" style="background:#58a6ff"></div><span id="leg-price">Price</span></div>
+            <div class="ch-ma-item"><div class="ch-ma-dot" style="background:#f0883e"></div><span id="leg-50">MA 50</span></div>
+            <div class="ch-ma-item"><div class="ch-ma-dot" style="background:#d2a8ff"></div><span id="leg-100">MA 100</span></div>
+            <div class="ch-ma-item"><div class="ch-ma-dot" style="background:#f85149"></div><span id="leg-200">MA 200</span></div>
+          </div>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="priceChart"></canvas>
+          <div class="chart-empty" id="chart-empty">← Select a stock to view chart</div>
+        </div>
+      </div>
+
+      <!-- DETAIL PANEL -->
+      <div class="detail-panel">
+        <!-- Fundamentals -->
+        <div class="dp-section">
+          <div class="dp-title">Fundamentals</div>
+          <div class="fund-grid" id="fund-grid">
+            <div class="fund-box"><div class="fund-label">Market Cap</div><div class="fund-val blue" id="f-cap">—</div></div>
+            <div class="fund-box"><div class="fund-label">P/E (TTM)</div><div class="fund-val" id="f-pe">—</div></div>
+            <div class="fund-box"><div class="fund-label">Fwd P/E</div><div class="fund-val" id="f-fpe">—</div></div>
+            <div class="fund-box"><div class="fund-label">EPS (TTM)</div><div class="fund-val" id="f-eps">—</div></div>
+            <div class="fund-box"><div class="fund-label">52W High</div><div class="fund-val green" id="f-52h">—</div></div>
+            <div class="fund-box"><div class="fund-label">52W Low</div><div class="fund-val red" id="f-52l">—</div></div>
+            <div class="fund-box"><div class="fund-label">Div Yield</div><div class="fund-val" id="f-div">—</div></div>
+            <div class="fund-box"><div class="fund-label">Beta</div><div class="fund-val" id="f-beta">—</div></div>
+            <div class="fund-box"><div class="fund-label">P/B</div><div class="fund-val" id="f-pb">—</div></div>
+            <div class="fund-box"><div class="fund-label">Net Margin</div><div class="fund-val" id="f-margin">—</div></div>
+          </div>
+          <div id="f-sector"></div>
+          <div class="desc" id="f-desc"></div>
+        </div>
+        <!-- Trade -->
+        <div class="dp-section">
+          <div class="dp-title">Place Order — <span id="trade-sym">—</span></div>
+          <div class="qty-row">
+            <span class="qty-label">Qty</span>
+            <input class="qty-input" id="qty" type="number" value="10" min="1">
+          </div>
+          <div class="trade-btns">
+            <button class="btn-buy" onclick="executeTrade('BUY')">BUY</button>
+            <button class="btn-sell" onclick="executeTrade('SELL')">SELL</button>
+          </div>
+          <div class="trade-msg" id="trade-msg"></div>
+        </div>
+        <!-- P&L -->
+        <div class="dp-section">
+          <div class="dp-title">Account</div>
+          <div class="pnl-grid">
+            <div class="pnl-box"><div class="pnl-label">Total P&L</div><div class="pnl-val green" id="p-pnl">+$0</div></div>
+            <div class="pnl-box"><div class="pnl-label">Trades</div><div class="pnl-val" id="p-trades">0</div></div>
+            <div class="pnl-box"><div class="pnl-label">Balance</div><div class="pnl-val" id="p-bal">$125,000</div></div>
+            <div class="pnl-box"><div class="pnl-label">Requests</div><div class="pnl-val blue" id="p-rc" style="color:#58a6ff">0</div></div>
+          </div>
+        </div>
+        <!-- Migration status -->
+        <div class="dp-section">
+          <div class="dp-title"><span class="live-dot"></span>Live Pod</div>
+          <div class="mig-row"><span class="mig-key">Host</span><span class="mig-val" id="m-host">—</span></div>
+          <div class="mig-row"><span class="mig-key">Pod IP</span><span class="mig-val" id="m-ip">—</span></div>
+          <div class="mig-row"><span class="mig-key">Node</span><span class="mig-val" id="m-node">—</span></div>
+          <div class="mig-row"><span class="mig-key">Uptime</span><span class="mig-val" id="m-up">0s</span></div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+    const API = '/api';
+    let stocks = {};
+    let sel = null;
+    let chart = null;
+    let pnl = 0, trades = 0;
+    let exchMode = 'NASDAQ';
+
+    function setExch(mode) {
+      exchMode = mode;
+      document.querySelectorAll('.exc-btn').forEach(b => b.classList.remove('active'));
+      document.getElementById('exc-' + mode.toLowerCase()).classList.add('active');
+      document.getElementById('add-sym').placeholder = mode === 'TASE' ? 'TEVA, NICE, POLI…' : 'AAPL, TSLA…';
+    }
+
+    // Currency symbol helper — uses stored currency from API, falls back to .TA heuristic
+    const CCY_MAP = { USD:'$', ILS:'₪', ILA:'₪', EUR:'€', GBP:'£', JPY:'¥', CAD:'$', AUD:'$' };
+    function ccy(sym) {
+      const d = stocks[sym];
+      if (d && d.currency && CCY_MAP[d.currency]) return CCY_MAP[d.currency];
+      return sym && sym.endsWith('.TA') ? '₪' : '$';
+    }
+    // Display name — strip .TA suffix for cleaner watchlist
+    function dispSym(sym) { return sym && sym.endsWith('.TA') ? sym.slice(0, -3) : sym; }
+
+    // Clock
+    function tick() {
+      const d = new Date();
+      document.getElementById('clock').textContent =
+        d.toLocaleTimeString('en-US',{hour12:false,timeZone:'America/New_York'}) + ' ET';
+    }
+    setInterval(tick, 1000); tick();
+
+    function fmt(n, dec=2) {
+      if (n == null) return '—';
+      return parseFloat(n).toLocaleString('en-US',{minimumFractionDigits:dec,maximumFractionDigits:dec});
+    }
+    function fmtVol(n) {
+      if (!n) return '—';
+      if (n >= 1e9) return (n/1e9).toFixed(1)+'B';
+      if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
+      if (n >= 1e3) return (n/1e3).toFixed(0)+'K';
+      return n;
+    }
+    function maInd(price, ma) {
+      if (!ma || !price) return '<span class="ma-ind ma-eq">—</span>';
+      const diff = ((price - ma) / ma * 100).toFixed(1);
+      const cls  = price > ma ? 'ma-up' : 'ma-dn';
+      const arr  = price > ma ? '▲' : '▼';
+      return `<span class="ma-ind ${cls}">${arr}${Math.abs(diff)}%</span>`;
+    }
+
+    // Render watchlist
+    function renderWatchlist() {
+      const body = document.getElementById('wl-body');
+      let html = '';
+      for (const [sym, d] of Object.entries(stocks)) {
+        if (d.loading) {
+          html += `<div class="loading-row">${sym}: Loading real data...</div>`;
+          continue;
+        }
+        const pos  = d.change >= 0;
+        const act  = sel === sym ? ' active' : '';
+        const c    = ccy(sym);
+        const label = dispSym(sym) + (sym.endsWith('.TA') ? '<span class="tase-badge">TA</span>' : '');
+        html += `<div class="wl-row${act}" onclick="selectStock('${sym}')">
+          <div><div class="sym">${label}</div></div>
+          <div class="sname" title="${d.name}">${d.name||sym}</div>
+          <div class="price">${c}${fmt(d.price)}</div>
+          <div class="chg ${pos?'pos':'neg'}">${pos?'+':''}${fmt(d.pct,2)}%</div>
+          <div class="ma-cell"><span class="ma-val">${d.ma50?c+fmt(d.ma50):'—'}</span>${maInd(d.price,d.ma50)}</div>
+          <div class="ma-cell"><span class="ma-val">${d.ma100?c+fmt(d.ma100):'—'}</span>${maInd(d.price,d.ma100)}</div>
+          <div class="ma-cell"><span class="ma-val">${d.ma200?c+fmt(d.ma200):'—'}</span>${maInd(d.price,d.ma200)}</div>
+          <div class="del-btn" onclick="event.stopPropagation();removeStock('${sym}')">✕</div>
+        </div>`;
+      }
+      body.innerHTML = html || '<div class="loading-row">Loading stocks…</div>';
+    }
+
+    // Ticker bar
+    function renderTicker() {
+      let t = '';
+      for (const [sym, d] of Object.entries(stocks)) {
+        if (d.loading) continue;
+        const pos = d.change >= 0;
+        const cls = pos ? 'tick-p' : 'tick-n';
+        t += `<div class="tick-item"><strong>${dispSym(sym)}</strong> <span class="${cls}">${ccy(sym)}${fmt(d.price)} ${pos?'+':''}${fmt(d.pct,2)}%</span></div>`;
+      }
+      // Duplicate for seamless loop
+      const el = document.getElementById('ticker');
+      el.innerHTML = `<div class="ticker-inner">${t}${t}</div>`;
+    }
+
+    // Update selected stock header + chart price
+    function updateChartHeader() {
+      if (!sel || !stocks[sel] || stocks[sel].loading) return;
+      const d = stocks[sel];
+      const c = ccy(sel);
+      document.getElementById('ch-sym').textContent = `${dispSym(sel)} — ${d.name||''}`;
+      document.getElementById('ch-price').textContent = c + fmt(d.price);
+      const pos = d.change >= 0;
+      const chg = document.getElementById('ch-chg');
+      chg.textContent = `${pos?'+':''}${c}${fmt(Math.abs(d.change))} (${pos?'+':''}${fmt(d.pct,2)}%)`;
+      chg.className = 'ch-chg ' + (pos ? 'pos' : 'neg');
+    }
+
+    // Fetch all stocks
+    async function fetchStocks() {
+      try {
+        const r = await fetch(API + '/stocks');
+        const d = await r.json();
+        for (const s of d.stocks) stocks[s.symbol] = s;
+        renderWatchlist();
+        renderTicker();
+        updateChartHeader();
+        // Status
+        document.getElementById('m-host').textContent = d.hostname || '—';
+        document.getElementById('m-ip').textContent   = d.pod_ip   || '—';
+        document.getElementById('m-node').textContent = (d.node||'').replace('.ec2.internal','');
+        document.getElementById('m-up').textContent   = d.uptime_s + 's';
+        document.getElementById('p-rc').textContent   = d.request_count;
+      } catch(e) { /* retry next poll */ }
+    }
+
+    // Select stock → fetch detail + render chart + fundamentals
+    async function selectStock(sym) {
+      sel = sym;
+      document.getElementById('trade-sym').textContent = sym;
+      renderWatchlist();
+      document.getElementById('chart-empty').style.display = 'none';
+      try {
+        const r = await fetch(API + '/stock/' + sym);
+        if (!r.ok) { document.getElementById('chart-empty').textContent = 'Loading data…'; return; }
+        const d = await r.json();
+        updateChartHeader();
+        renderChart(d);
+        renderFundamentals(d.fundamentals || {});
+      } catch(e) { console.error(e); }
+    }
+
+    // Chart.js price + MA chart
+    function renderChart(d) {
+      const ctx = document.getElementById('priceChart').getContext('2d');
+      if (chart) chart.destroy();
+      const c = d.chart || {};
+      const datasets = [
+        { label: 'Price', data: c.closes, borderColor: '#58a6ff', borderWidth: 2, pointRadius: 0, tension: 0.2, fill: false, order: 1 },
+        { label: 'MA 50',  data: c.ma50,  borderColor: '#f0883e', borderWidth: 1.5, borderDash: [], pointRadius: 0, tension: 0, fill: false, spanGaps: true },
+        { label: 'MA 100', data: c.ma100, borderColor: '#d2a8ff', borderWidth: 1.5, borderDash: [4,3], pointRadius: 0, tension: 0, fill: false, spanGaps: true },
+        { label: 'MA 200', data: c.ma200, borderColor: '#f85149', borderWidth: 1.5, borderDash: [6,3], pointRadius: 0, tension: 0, fill: false, spanGaps: true },
+      ];
+      // Update legend values
+      const cc = ccy(sel);
+      document.getElementById('leg-price').textContent = 'Price ' + cc + fmt(d.price);
+      document.getElementById('leg-50').textContent    = 'MA 50 '  + (d.ma50  ? cc+fmt(d.ma50)  : '—');
+      document.getElementById('leg-100').textContent   = 'MA 100 ' + (d.ma100 ? cc+fmt(d.ma100) : '—');
+      document.getElementById('leg-200').textContent   = 'MA 200 ' + (d.ma200 ? cc+fmt(d.ma200) : '—');
+      chart = new Chart(ctx, {
+        type: 'line',
+        data: { labels: c.dates || [], datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          animation: { duration: 300 },
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: '#161b22', borderColor: '#30363d', borderWidth: 1,
+              titleColor: '#8b949e', bodyColor: '#e6edf3',
+              callbacks: { label: ctx => ` ${ctx.dataset.label}: ${ccy(sel)}${fmt(ctx.parsed.y)}` }
+            }
+          },
+          scales: {
+            x: {
+              grid: { color: '#21262d' }, ticks: { color: '#8b949e', maxTicksLimit: 8, font: { size: 10 } },
+              ticks: { callback: (v, i, vals) => { const d = (c.dates||[])[i]; return d ? d.slice(5) : ''; }, maxTicksLimit: 8, color: '#8b949e' }
+            },
+            y: {
+              grid: { color: '#21262d' }, ticks: { color: '#8b949e', font: { size: 10 },
+              callback: v => '$' + v.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0}) }
+            }
+          }
+        }
+      });
+    }
+
+    // Render fundamentals
+    function renderFundamentals(f) {
+      const set = (id, val, suf='') => { document.getElementById(id).textContent = val != null ? val + suf : '—'; };
+      set('f-cap',    f.market_cap);
+      set('f-pe',     f.trailing_pe);
+      set('f-fpe',    f.forward_pe);
+      set('f-eps',    f.eps != null ? '$'+fmt(f.eps) : null);
+      set('f-52h',    f.high_52w != null ? '$'+fmt(f.high_52w) : null);
+      set('f-52l',    f.low_52w  != null ? '$'+fmt(f.low_52w)  : null);
+      set('f-div',    f.div_yield != null ? f.div_yield+'%' : null);
+      set('f-beta',   f.beta);
+      set('f-pb',     f.pb);
+      set('f-margin', f.profit_margin != null ? f.profit_margin+'%' : null);
+      const sec = document.getElementById('f-sector');
+      sec.innerHTML = f.sector && f.sector !== '—'
+        ? `<div class="sector-badge">${f.sector}</div><span style="font-size:10px;color:#8b949e;margin-left:6px">${f.industry||''}</span>` : '';
+      document.getElementById('f-desc').textContent = f.description || '';
+    }
+
+    // Add stock
+    async function addStock() {
+      const inp = document.getElementById('add-sym');
+      let sym = inp.value.trim().toUpperCase().replace(/\s+/g, '');
+      if (!sym) return;
+      // Auto-append .TA suffix for Tel Aviv exchange
+      if (exchMode === 'TASE' && !sym.endsWith('.TA')) sym += '.TA';
+      if (stocks[sym]) { inp.value = ''; return; }  // already in list
+      stocks[sym] = { symbol: sym, loading: true };
+      renderWatchlist();
+      inp.value = '';
+      try {
+        const r = await fetch(API + '/stocks/add', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ symbol: sym })
+        });
+        const j = await r.json();
+        if (j.status === 'error') {
+          delete stocks[sym];
+          renderWatchlist();
+          alert('Symbol not found: ' + sym);
+        }
+      } catch(e) { console.error(e); }
+    }
+    document.getElementById('add-sym').addEventListener('keydown', e => { if (e.key === 'Enter') addStock(); });
+
+    // Remove stock
+    async function removeStock(sym) {
+      if (!confirm(`Remove ${sym} from watchlist?`)) return;
+      delete stocks[sym];
+      if (sel === sym) { sel = null; if (chart) { chart.destroy(); chart = null; } }
+      renderWatchlist();
+      try {
+        await fetch(API + '/stocks/' + sym, { method: 'DELETE' });
+      } catch(e) { console.error(e); }
+    }
+
+    // Trade
+    async function executeTrade(side) {
+      if (!sel) return;
+      const qty = parseInt(document.getElementById('qty').value) || 10;
+      try {
+        const r  = await fetch(API + '/trade', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ symbol: sel, qty })
+        });
+        const d  = await r.json();
+        pnl    = d.pnl; trades = d.trades;
+        const g  = d.gain;
+        const sp = g >= 0 ? '+' : '';
+        document.getElementById('trade-msg').textContent =
+          `${side} ${qty}×${sel}  ${sp}$${fmt(Math.abs(g))}`;
+        const pnlEl = document.getElementById('p-pnl');
+        pnlEl.textContent = (pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(pnl));
+        pnlEl.className   = 'pnl-val ' + (pnl >= 0 ? 'green' : 'red');
+        document.getElementById('p-trades').textContent = trades;
+        const bal = 125000 + pnl;
+        document.getElementById('p-bal').textContent   = '$' + fmt(bal);
+        document.getElementById('nav-bal').textContent = '$' + fmt(bal);
+        setTimeout(() => document.getElementById('trade-msg').textContent = '', 3000);
+      } catch(e) { console.error(e); }
+    }
+
+    // Boot
+    fetchStocks();
+    setInterval(fetchStocks, 8000);
+    </script>
+    </body>
+    </html>
+---
+# New stock-backend pod — Python 3.11 + yfinance for real market data
+# This pod IS MIGRATABLE via CRIU (state: request_count, trade_count, pnl_total)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stock-backend-v2
+  namespace: stock-app
+  labels:
+    app: stock-backend
+    migration-role: source
+    tier: backend
+    version: v2
+spec:
+  restartPolicy: Never
+  containers:
+    - name: backend
+      image: python:3.11-slim
+      command:
+        - sh
+        - -c
+        - |
+          pip install flask flask-cors yfinance pandas numpy --quiet 2>&1 | tail -3
+          python3 /scripts/app.py
+      ports:
+        - containerPort: 8080
+      env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      resources:
+        requests:
+          cpu: 50m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 512Mi
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        initialDelaySeconds: 90
+        periodSeconds: 10
+        failureThreshold: 12
+      volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+  volumes:
+    - name: scripts
+      configMap:
+        name: stock-backend-config

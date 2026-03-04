@@ -1,0 +1,616 @@
+---
+# Namespace for stock trading app
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: stock-app
+  labels:
+    app: stock-trading
+---
+# PostgreSQL StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: stock-postgres
+  namespace: stock-app
+spec:
+  serviceName: stock-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stock-postgres
+  template:
+    metadata:
+      labels:
+        app: stock-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          env:
+            - name: POSTGRES_DB
+              value: stockdb
+            - name: POSTGRES_USER
+              value: trader
+            - name: POSTGRES_PASSWORD
+              value: StockSecret123!
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp2
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stock-postgres
+  namespace: stock-app
+spec:
+  selector:
+    app: stock-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None
+---
+# Stock Trading Backend — Python Flask with SSE real-time prices
+# This pod is what we will LIVE MIGRATE with CRIU
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stock-backend
+  namespace: stock-app
+  labels:
+    app: stock-backend
+    migration-role: source
+    tier: backend
+spec:
+  serviceAccountName: default
+  restartPolicy: Never
+  containers:
+    - name: backend
+      image: python:3.11-slim
+      command:
+        - sh
+        - -c
+        - |
+          pip install flask flask-cors psycopg2-binary --quiet 2>/dev/null
+          python3 - << 'PYEOF'
+          import os, time, threading, random, math, json
+          from flask import Flask, jsonify, Response, stream_with_context
+          from flask_cors import CORS
+
+          app = Flask(__name__)
+          CORS(app)
+
+          # === STATEFUL DATA (preserved by CRIU) ===
+          request_count = 0
+          trade_count   = 0
+          pnl_total     = 0.0
+          start_time    = time.time()
+          lock          = threading.Lock()
+
+          # Stock universe
+          STOCKS = {
+            "AAPL": {"name": "Apple Inc",       "price": 189.50, "prev": 187.20},
+            "TSLA": {"name": "Tesla Inc",        "price": 248.30, "prev": 245.10},
+            "NVDA": {"name": "NVIDIA Corp",      "price": 875.20, "prev": 862.40},
+            "AMZN": {"name": "Amazon.com Inc",   "price": 178.90, "prev": 176.30},
+            "MSFT": {"name": "Microsoft Corp",   "price": 415.80, "prev": 413.20},
+            "GOOG": {"name": "Alphabet Inc",     "price": 175.40, "prev": 174.10},
+            "META": {"name": "Meta Platforms",   "price": 512.30, "prev": 508.70},
+            "JPM":  {"name": "JPMorgan Chase",   "price": 198.50, "prev": 196.20},
+          }
+
+          prices = {k: v["price"] for k, v in STOCKS.items()}
+          price_lock = threading.Lock()
+
+          def simulate_prices():
+              """Continuously simulate realistic stock price movement"""
+              while True:
+                  time.sleep(1)
+                  with price_lock:
+                      for sym in prices:
+                          drift  = 0.0001 * (random.random() - 0.48)
+                          noise  = 0.003  * random.gauss(0, 1)
+                          prices[sym] = max(1.0, prices[sym] * (1 + drift + noise))
+
+          threading.Thread(target=simulate_prices, daemon=True).start()
+
+          @app.route('/health')
+          def health():
+              return 'ok'
+
+          @app.route('/api/stocks')
+          def get_stocks():
+              global request_count
+              with lock:
+                  request_count += 1
+                  rc = request_count
+              with price_lock:
+                  result = []
+                  for sym, info in STOCKS.items():
+                      p     = prices[sym]
+                      prev  = info["prev"]
+                      chg   = p - prev
+                      pct   = (chg / prev) * 100
+                      result.append({
+                          "symbol":  sym,
+                          "name":    info["name"],
+                          "price":   round(p, 2),
+                          "change":  round(chg, 2),
+                          "pct":     round(pct, 2),
+                          "volume":  random.randint(1_000_000, 50_000_000),
+                      })
+              return jsonify({
+                  "stocks": sorted(result, key=lambda x: x["symbol"]),
+                  "request_count":  rc,
+                  "uptime_s":       round(time.time() - start_time, 1),
+                  "pod_ip":         os.environ.get("POD_IP", ""),
+                  "node":           os.environ.get("NODE_NAME", ""),
+                  "hostname":       os.environ.get("HOSTNAME", ""),
+                  "pid":            os.getpid(),
+              })
+
+          @app.route('/api/trade', methods=['POST'])
+          def trade():
+              global trade_count, pnl_total
+              with lock:
+                  trade_count += 1
+                  pnl_total   += random.uniform(-500, 800)
+                  tc  = trade_count
+                  pnl = pnl_total
+              return jsonify({"trades": tc, "pnl": round(pnl, 2)})
+
+          @app.route('/api/status')
+          def status():
+              with lock:
+                  rc  = request_count
+                  tc  = trade_count
+                  pnl = pnl_total
+              return jsonify({
+                  "request_count": rc,
+                  "trade_count":   tc,
+                  "pnl_total":     round(pnl, 2),
+                  "uptime_s":      round(time.time() - start_time, 1),
+                  "pod_ip":        os.environ.get("POD_IP", ""),
+                  "node":          os.environ.get("NODE_NAME", ""),
+                  "hostname":      os.environ.get("HOSTNAME", ""),
+                  "pid":           os.getpid(),
+              })
+
+          print(f'stock-backend starting | pid={os.getpid()} | node={os.environ.get("NODE_NAME","")} | ip={os.environ.get("POD_IP","")}', flush=True)
+          app.run(host='0.0.0.0', port=8080)
+          PYEOF
+      ports:
+        - containerPort: 8080
+      env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      resources:
+        requests:
+          cpu: 20m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        initialDelaySeconds: 25
+        periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stock-backend-svc
+  namespace: stock-app
+spec:
+  selector:
+    app: stock-backend
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+# Frontend — Nginx serving a Plus500-like HTML trading interface
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stock-frontend-html
+  namespace: stock-app
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TraderPro — Live Stock Platform</title>
+    <style>
+      * { margin:0; padding:0; box-sizing:border-box; }
+      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#0d1117; color:#e6edf3; }
+
+      /* TOP NAV */
+      nav { background:#161b22; border-bottom:1px solid #30363d; padding:0 24px; height:56px; display:flex; align-items:center; justify-content:space-between; position:sticky; top:0; z-index:100; }
+      .logo { font-size:20px; font-weight:700; color:#58a6ff; letter-spacing:-0.5px; }
+      .logo span { color:#3fb950; }
+      .nav-right { display:flex; align-items:center; gap:16px; font-size:14px; }
+      .balance-box { background:#1f6feb22; border:1px solid #1f6feb; border-radius:8px; padding:6px 16px; }
+      .balance-label { color:#8b949e; font-size:11px; }
+      .balance-val { color:#3fb950; font-weight:700; font-size:16px; }
+
+      /* MAIN LAYOUT */
+      .main { display:grid; grid-template-columns:1fr 320px; gap:0; height:calc(100vh - 56px); }
+
+      /* WATCHLIST */
+      .watchlist { border-right:1px solid #21262d; overflow-y:auto; }
+      .section-header { padding:12px 16px; background:#161b22; border-bottom:1px solid #21262d; font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:1px; color:#8b949e; display:flex; justify-content:space-between; }
+      .stock-row { display:grid; grid-template-columns:72px 1fr 90px 80px 80px; align-items:center; padding:10px 16px; border-bottom:1px solid #21262d11; cursor:pointer; transition:background 0.1s; }
+      .stock-row:hover { background:#161b2288; }
+      .symbol { font-size:14px; font-weight:700; color:#e6edf3; }
+      .sname  { font-size:12px; color:#8b949e; margin-top:2px; }
+      .price  { font-size:14px; font-weight:600; text-align:right; font-variant-numeric:tabular-nums; }
+      .change { font-size:12px; font-weight:600; text-align:right; padding:2px 6px; border-radius:4px; }
+      .pos  { color:#3fb950; background:#3fb95011; }
+      .neg  { color:#f85149; background:#f8514911; }
+      .volume { font-size:11px; color:#8b949e; text-align:right; }
+
+      /* RIGHT PANEL */
+      .right-panel { display:flex; flex-direction:column; overflow-y:auto; }
+
+      /* TRADE CARD */
+      .trade-card { padding:16px; border-bottom:1px solid #21262d; }
+      .trade-title { font-size:13px; font-weight:600; color:#8b949e; margin-bottom:12px; text-transform:uppercase; letter-spacing:0.5px; }
+      .selected-stock { background:#1f6feb11; border:1px solid #1f6feb44; border-radius:8px; padding:12px; margin-bottom:12px; }
+      .sel-sym  { font-size:18px; font-weight:700; }
+      .sel-price{ font-size:28px; font-weight:700; color:#58a6ff; margin:4px 0; }
+      .trade-btns { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:12px; }
+      .btn { padding:12px; border:none; border-radius:8px; font-size:14px; font-weight:700; cursor:pointer; transition:opacity 0.2s; }
+      .btn-buy  { background:#3fb950; color:#fff; }
+      .btn-sell { background:#f85149; color:#fff; }
+      .btn:hover { opacity:0.85; }
+      .qty-row { display:flex; align-items:center; gap:8px; margin-bottom:12px; }
+      .qty-label { font-size:12px; color:#8b949e; width:60px; }
+      .qty-input { flex:1; background:#21262d; border:1px solid #30363d; color:#e6edf3; padding:6px 10px; border-radius:6px; font-size:14px; }
+
+      /* MIGRATION STATUS */
+      .mig-card { padding:16px; border-bottom:1px solid #21262d; }
+      .mig-title { font-size:13px; font-weight:600; color:#8b949e; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:12px; }
+      .mig-row { display:flex; justify-content:space-between; align-items:center; padding:6px 0; border-bottom:1px solid #21262d11; font-size:12px; }
+      .mig-key   { color:#8b949e; }
+      .mig-val   { font-family:monospace; color:#58a6ff; font-size:11px; }
+      .mig-val.green { color:#3fb950; }
+      .mig-val.yellow { color:#d29922; }
+      .status-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px; }
+      .dot-green  { background:#3fb950; box-shadow:0 0 6px #3fb950; }
+      .dot-yellow { background:#d29922; }
+
+      /* ACCOUNT SUMMARY */
+      .account-card { padding:16px; }
+      .account-title { font-size:13px; font-weight:600; color:#8b949e; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:12px; }
+      .pnl-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+      .pnl-box  { background:#161b22; border:1px solid #21262d; border-radius:8px; padding:10px; }
+      .pnl-label { font-size:11px; color:#8b949e; }
+      .pnl-val   { font-size:16px; font-weight:700; margin-top:4px; }
+      .green { color:#3fb950; }
+      .red   { color:#f85149; }
+      .ticker-bar { background:#161b22; border-top:1px solid #21262d; padding:8px 16px; overflow:hidden; white-space:nowrap; font-size:12px; font-weight:600; }
+      .ticker-scroll { display:inline-block; animation:scroll 30s linear infinite; }
+      @keyframes scroll { 0% {transform:translateX(100vw)} 100% {transform:translateX(-100%)} }
+      .tick-item { display:inline-block; margin:0 24px; }
+      .tick-pos { color:#3fb950; } .tick-neg { color:#f85149; }
+    </style>
+    </head>
+    <body>
+
+    <nav>
+      <div class="logo">Trader<span>Pro</span> ⚡</div>
+      <div class="nav-right">
+        <div id="clock" style="color:#8b949e;font-size:13px;font-variant-numeric:tabular-nums"></div>
+        <div class="balance-box">
+          <div class="balance-label">EQUITY</div>
+          <div class="balance-val" id="nav-balance">$125,430.00</div>
+        </div>
+      </div>
+    </nav>
+
+    <div class="ticker-bar">
+      <div class="ticker-scroll" id="ticker-scroll">Loading market data...</div>
+    </div>
+
+    <div class="main">
+      <!-- WATCHLIST -->
+      <div class="watchlist">
+        <div class="section-header">
+          <span>Markets — Live Prices</span>
+          <span id="last-update" style="color:#3fb950">●  LIVE</span>
+        </div>
+        <div class="section-header" style="padding:8px 16px;font-size:11px;grid-template-columns:72px 1fr 90px 80px 80px;display:grid;font-weight:400">
+          <span>SYMBOL</span><span>NAME</span><span style="text-align:right">PRICE</span><span style="text-align:right">CHG%</span><span style="text-align:right">VOLUME</span>
+        </div>
+        <div id="stock-list"></div>
+      </div>
+
+      <!-- RIGHT PANEL -->
+      <div class="right-panel">
+
+        <!-- TRADE WIDGET -->
+        <div class="trade-card">
+          <div class="trade-title">Place Order</div>
+          <div class="selected-stock">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <div>
+                <div class="sel-sym" id="sel-symbol">AAPL</div>
+                <div style="font-size:12px;color:#8b949e" id="sel-name">Apple Inc</div>
+              </div>
+              <div style="text-align:right">
+                <div class="sel-price" id="sel-price">$189.50</div>
+                <div class="change pos" id="sel-change">+1.2%</div>
+              </div>
+            </div>
+          </div>
+          <div class="qty-row">
+            <span class="qty-label">Quantity</span>
+            <input class="qty-input" id="qty" type="number" value="10" min="1">
+          </div>
+          <div class="trade-btns">
+            <button class="btn btn-buy"  onclick="executeTrade('BUY')">BUY</button>
+            <button class="btn btn-sell" onclick="executeTrade('SELL')">SELL</button>
+          </div>
+          <div id="trade-msg" style="font-size:12px;color:#8b949e;text-align:center;min-height:18px"></div>
+        </div>
+
+        <!-- MIGRATION STATUS -->
+        <div class="mig-card">
+          <div class="mig-title"><span class="status-dot dot-green"></span>Live Migration Status</div>
+          <div class="mig-row"><span class="mig-key">Pod Hostname</span><span class="mig-val" id="m-host">—</span></div>
+          <div class="mig-row"><span class="mig-key">Pod IP</span><span class="mig-val" id="m-ip">—</span></div>
+          <div class="mig-row"><span class="mig-key">Node</span><span class="mig-val" id="m-node">—</span></div>
+          <div class="mig-row"><span class="mig-key">PID</span><span class="mig-val" id="m-pid">—</span></div>
+          <div class="mig-row"><span class="mig-key">Requests Served</span><span class="mig-val green" id="m-req">0</span></div>
+          <div class="mig-row"><span class="mig-key">Uptime</span><span class="mig-val" id="m-uptime">0s</span></div>
+        </div>
+
+        <!-- P&L SUMMARY -->
+        <div class="account-card">
+          <div class="account-title">Account Summary</div>
+          <div class="pnl-grid">
+            <div class="pnl-box">
+              <div class="pnl-label">Total P&amp;L</div>
+              <div class="pnl-val green" id="total-pnl">+$0.00</div>
+            </div>
+            <div class="pnl-box">
+              <div class="pnl-label">Trades</div>
+              <div class="pnl-val" id="total-trades">0</div>
+            </div>
+            <div class="pnl-box">
+              <div class="pnl-label">Balance</div>
+              <div class="pnl-val green" id="acc-balance">$125,430</div>
+            </div>
+            <div class="pnl-box">
+              <div class="pnl-label">Margin Used</div>
+              <div class="pnl-val yellow" id="margin-used" style="color:#d29922">12.4%</div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <script>
+    const BACKEND = '/api';
+    let stockData = {};
+    let selectedSym = 'AAPL';
+    let totalPnl = 0;
+    let totalTrades = 0;
+
+    function fmt(n) { return n.toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2}); }
+    function fmtVol(n) {
+      if (n >= 1e9) return (n/1e9).toFixed(1)+'B';
+      if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
+      if (n >= 1e3) return (n/1e3).toFixed(0)+'K';
+      return n;
+    }
+
+    function clock() {
+      const d = new Date();
+      document.getElementById('clock').textContent = d.toLocaleTimeString('en-US',{hour12:false}) + ' UTC';
+    }
+    setInterval(clock, 1000); clock();
+
+    async function fetchStocks() {
+      try {
+        const r = await fetch(BACKEND + '/stocks');
+        const d = await r.json();
+        renderStocks(d.stocks);
+        updateStatus(d);
+      } catch(e) { document.getElementById('last-update').textContent = '⚠ RECONNECTING'; }
+    }
+
+    function renderStocks(stocks) {
+      document.getElementById('last-update').textContent = '●  LIVE';
+      const el = document.getElementById('stock-list');
+      el.innerHTML = '';
+      let ticker = '';
+      stocks.forEach(s => {
+        stockData[s.symbol] = s;
+        const pos = s.change >= 0;
+        const row = document.createElement('div');
+        row.className = 'stock-row';
+        row.innerHTML = `
+          <div><div class="symbol">${s.symbol}</div></div>
+          <div><div class="sname">${s.name}</div></div>
+          <div class="price">$${fmt(s.price)}</div>
+          <div class="change ${pos?'pos':'neg'}">${pos?'+':''}${s.pct.toFixed(2)}%</div>
+          <div class="volume">${fmtVol(s.volume)}</div>`;
+        row.onclick = () => selectStock(s.symbol);
+        if (s.symbol === selectedSym) row.style.background = '#1f6feb11';
+        el.appendChild(row);
+        ticker += `<span class="tick-item">${s.symbol} <span class="${pos?'tick-pos':'tick-neg'}">$${fmt(s.price)} (${pos?'+':''}${s.pct.toFixed(2)}%)</span></span>`;
+      });
+      document.getElementById('ticker-scroll').innerHTML = ticker;
+      if (stockData[selectedSym]) {
+        const s = stockData[selectedSym];
+        const pos = s.change >= 0;
+        document.getElementById('sel-price').textContent = '$' + fmt(s.price);
+        document.getElementById('sel-change').className = 'change ' + (pos?'pos':'neg');
+        document.getElementById('sel-change').textContent = (pos?'+':'') + s.pct.toFixed(2)+'%';
+      }
+    }
+
+    function selectStock(sym) {
+      selectedSym = sym;
+      const s = stockData[sym];
+      if (!s) return;
+      document.getElementById('sel-symbol').textContent = s.symbol;
+      document.getElementById('sel-name').textContent = s.name;
+      document.getElementById('sel-price').textContent = '$' + fmt(s.price);
+      const pos = s.change >= 0;
+      document.getElementById('sel-change').className = 'change ' + (pos?'pos':'neg');
+      document.getElementById('sel-change').textContent = (pos?'+':'') + s.pct.toFixed(2)+'%';
+    }
+
+    function updateStatus(d) {
+      document.getElementById('m-host').textContent   = d.hostname || '—';
+      document.getElementById('m-ip').textContent     = d.pod_ip   || '—';
+      document.getElementById('m-node').textContent   = (d.node||'—').replace('.ec2.internal','');
+      document.getElementById('m-pid').textContent    = d.pid      || '—';
+      document.getElementById('m-req').textContent    = d.request_count;
+      document.getElementById('m-uptime').textContent = d.uptime_s + 's';
+    }
+
+    async function executeTrade(side) {
+      const qty = parseInt(document.getElementById('qty').value) || 1;
+      const s   = stockData[selectedSym];
+      if (!s) return;
+      const val = (s.price * qty).toFixed(2);
+      try {
+        const r  = await fetch(BACKEND + '/trade', {method:'POST'});
+        const d  = await r.json();
+        totalPnl    = d.pnl;
+        totalTrades = d.trades;
+        const sign = totalPnl >= 0 ? '+' : '';
+        document.getElementById('total-pnl').textContent    = sign + '$' + fmt(Math.abs(totalPnl));
+        document.getElementById('total-pnl').className      = 'pnl-val ' + (totalPnl>=0?'green':'red');
+        document.getElementById('total-trades').textContent = totalTrades;
+        const bal = 125430 + totalPnl;
+        document.getElementById('acc-balance').textContent  = '$' + fmt(bal);
+        document.getElementById('nav-balance').textContent  = '$' + fmt(bal);
+        const msg = `${side} ${qty} × ${selectedSym} @ $${fmt(s.price)}  ▸  $${val}`;
+        const msgEl = document.getElementById('trade-msg');
+        msgEl.textContent = msg;
+        msgEl.style.color = side==='BUY' ? '#3fb950' : '#f85149';
+        setTimeout(() => { msgEl.textContent = ''; }, 3000);
+      } catch(e) { console.error(e); }
+    }
+
+    // Poll every 1s for live prices
+    fetchStocks();
+    setInterval(fetchStocks, 1000);
+    </script>
+    </body>
+    </html>
+
+  nginx.conf: |
+    server {
+      listen 80;
+      root /usr/share/nginx/html;
+      index index.html;
+
+      # Proxy API calls to backend
+      location /api/ {
+        proxy_pass http://stock-backend-svc.stock-app.svc.cluster.local:8080/api/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 30;
+      }
+
+      location / {
+        try_files $uri $uri/ /index.html;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stock-frontend
+  namespace: stock-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: stock-frontend
+  template:
+    metadata:
+      labels:
+        app: stock-frontend
+        tier: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html/index.html
+              subPath: index.html
+            - name: html
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: nginx.conf
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      volumes:
+        - name: html
+          configMap:
+            name: stock-frontend-html
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stock-frontend-svc
+  namespace: stock-app
+  annotations:
+    # Restrict external access to user's public IP only
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  selector:
+    app: stock-frontend
+  ports:
+    - port: 80
+      targetPort: 80
+  type: LoadBalancer
+  loadBalancerSourceRanges:
+    - "87.71.217.38/32"

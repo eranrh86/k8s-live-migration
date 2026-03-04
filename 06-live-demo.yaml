@@ -1,0 +1,92 @@
+---
+# New live-demo pod: Flask counter app that we will live-migrate
+# Forced to ip-192-168-14-92 (source node) so migration is cross-node
+apiVersion: v1
+kind: Pod
+metadata:
+  name: live-demo
+  namespace: live-migration
+  labels:
+    app: live-demo
+    migration-role: source
+spec:
+  serviceAccountName: migration-agent
+  restartPolicy: Never
+  containers:
+    - name: counter
+      image: python:3.11-slim
+      command:
+        - sh
+        - -c
+        - |
+          pip install flask --quiet 2>/dev/null
+          python3 - << 'PYEOF'
+          import os, time, threading
+          from flask import Flask, jsonify
+          app = Flask(__name__)
+          counter   = 0
+          start     = time.time()
+          lock      = threading.Lock()
+          def bg():
+              global counter
+              while True:
+                  time.sleep(1)
+                  with lock:
+                      counter += 1
+          threading.Thread(target=bg, daemon=True).start()
+          @app.route('/counter')
+          def gc():
+              with lock: v = counter
+              return jsonify({
+                  'counter':  v,
+                  'pid':      os.getpid(),
+                  'hostname': os.environ.get('HOSTNAME',''),
+                  'node':     os.environ.get('NODE_NAME',''),
+                  'pod_ip':   os.environ.get('POD_IP',''),
+                  'uptime_s': round(time.time()-start,1)
+              })
+          @app.route('/health')
+          def h(): return 'ok'
+          print(f'live-demo starting | pid={os.getpid()} | node={os.environ.get("NODE_NAME","")} | ip={os.environ.get("POD_IP","")}', flush=True)
+          app.run(host='0.0.0.0', port=8080)
+          PYEOF
+      ports:
+        - containerPort: 8080
+      env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      resources:
+        requests:
+          cpu: 10m
+          memory: 64Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        initialDelaySeconds: 15
+        periodSeconds: 5
+---
+# Stable ClusterIP service — IP does NOT change across migrations
+apiVersion: v1
+kind: Service
+metadata:
+  name: live-demo-svc
+  namespace: live-migration
+  labels:
+    app: live-demo
+spec:
+  selector:
+    app: live-demo
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP

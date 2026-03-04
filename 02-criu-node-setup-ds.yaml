@@ -1,0 +1,80 @@
+---
+# DaemonSet: installs CRIU on every EKS AL2023 node via chroot on the host root.
+# Uses /proc/1/root as the host filesystem — no nsenter binary required.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: criu-node-setup
+  namespace: kube-system
+  labels:
+    app: criu-node-setup
+spec:
+  selector:
+    matchLabels:
+      app: criu-node-setup
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100%
+  template:
+    metadata:
+      labels:
+        app: criu-node-setup
+    spec:
+      hostPID: true
+      hostNetwork: true
+      tolerations:
+        - operator: Exists
+      priorityClassName: system-node-critical
+      initContainers:
+        - name: install-criu
+          image: amazonlinux:2023
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "=== CRIU Node Prep on $(cat /host/etc/hostname 2>/dev/null || echo unknown) ==="
+
+              # chroot into host to use host's package manager and binaries
+              # We mount the host root at /host
+              echo "[1/3] Installing criu + socat on host..."
+              chroot /host /bin/bash -c "
+                dnf install -y criu socat util-linux --quiet 2>&1 | tail -5
+                echo 'CRIU version:' \$(criu --version)
+              "
+
+              echo "[2/3] Setting sysctl on host..."
+              # ptrace_scope=0 is REQUIRED for CRIU
+              chroot /host /bin/bash -c "
+                sysctl -w kernel.yama.ptrace_scope=0 || echo 'ptrace_scope set failed (may need reboot)'
+                sysctl -w user.max_user_namespaces=65536 || true
+                mkdir -p /etc/sysctl.d
+                echo 'kernel.yama.ptrace_scope = 0' > /etc/sysctl.d/99-criu.conf
+                echo 'user.max_user_namespaces = 65536' >> /etc/sysctl.d/99-criu.conf
+                echo 'ptrace_scope now:' \$(cat /proc/sys/kernel/yama/ptrace_scope)
+              "
+
+              echo "[3/3] CRIU health check on host..."
+              chroot /host /bin/bash -c "
+                criu check 2>&1 | head -10 || true
+                echo 'criu check done'
+              " || true
+
+              echo "=== Node prep complete ==="
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: 1m
+              memory: 4Mi
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /

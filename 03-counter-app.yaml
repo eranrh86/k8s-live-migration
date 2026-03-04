@@ -1,0 +1,166 @@
+---
+# RBAC for migration agent
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: migration-agent
+  namespace: live-migration
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: migration-agent
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get", "post", "create"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: migration-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: migration-agent
+subjects:
+  - kind: ServiceAccount
+    name: migration-agent
+    namespace: live-migration
+---
+# Counter App - Python Flask that keeps an in-memory counter
+# This is the app we will live-migrate
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: counter-app-script
+  namespace: live-migration
+data:
+  app.py: |
+    #!/usr/bin/env python3
+    import os, time, threading
+    from flask import Flask, jsonify
+
+    app = Flask(__name__)
+    counter = 0
+    start_time = time.time()
+    lock = threading.Lock()
+
+    def background_increment():
+        global counter
+        while True:
+            time.sleep(1)
+            with lock:
+                counter += 1
+
+    t = threading.Thread(target=background_increment, daemon=True)
+    t.start()
+
+    @app.route('/counter')
+    def get_counter():
+        with lock:
+            val = counter
+        return jsonify({
+            'counter': val,
+            'pid': os.getpid(),
+            'hostname': os.environ.get('HOSTNAME', 'unknown'),
+            'uptime_seconds': round(time.time() - start_time, 1)
+        })
+
+    @app.route('/health')
+    def health():
+        return 'ok'
+
+    if __name__ == '__main__':
+        print(f"Counter app starting on port 8080, pid={os.getpid()}", flush=True)
+        app.run(host='0.0.0.0', port=8080)
+---
+# StatefulSet for predictable pod naming + headless service for stable DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: counter-headless
+  namespace: live-migration
+  labels:
+    app: counter
+spec:
+  clusterIP: None
+  selector:
+    app: counter
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: counter-svc
+  namespace: live-migration
+  labels:
+    app: counter
+spec:
+  selector:
+    app: counter
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: counter
+  namespace: live-migration
+  labels:
+    app: counter
+spec:
+  serviceName: counter-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: counter
+  template:
+    metadata:
+      labels:
+        app: counter
+    spec:
+      serviceAccountName: migration-agent
+      containers:
+        - name: counter
+          image: python:3.11-slim
+          command:
+            - sh
+            - -c
+            - |
+              pip install flask --quiet && python /app/app.py
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: app-script
+              mountPath: /app
+      volumes:
+        - name: app-script
+          configMap:
+            name: counter-app-script
