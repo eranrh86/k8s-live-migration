@@ -32,6 +32,176 @@ data:
     data_lock   = threading.Lock()
     loading_set = set()
 
+    # ── Stock catalog for search autocomplete ──────────────────────
+    # Each entry: (symbol, full_name, exchange, sector, country_code)
+    CATALOG = [
+        # US — Technology
+        ("AAPL","Apple Inc","NASDAQ","Technology","US"),
+        ("MSFT","Microsoft Corp","NASDAQ","Technology","US"),
+        ("GOOGL","Alphabet Inc (Class A)","NASDAQ","Technology","US"),
+        ("GOOG","Alphabet Inc (Class C)","NASDAQ","Technology","US"),
+        ("AMZN","Amazon.com Inc","NASDAQ","Consumer Cyclical","US"),
+        ("META","Meta Platforms Inc","NASDAQ","Technology","US"),
+        ("NVDA","NVIDIA Corporation","NASDAQ","Technology","US"),
+        ("TSLA","Tesla Inc","NASDAQ","Consumer Cyclical","US"),
+        ("AMD","Advanced Micro Devices","NASDAQ","Technology","US"),
+        ("INTC","Intel Corporation","NASDAQ","Technology","US"),
+        ("QCOM","Qualcomm Inc","NASDAQ","Technology","US"),
+        ("AVGO","Broadcom Inc","NASDAQ","Technology","US"),
+        ("TXN","Texas Instruments","NASDAQ","Technology","US"),
+        ("MU","Micron Technology","NASDAQ","Technology","US"),
+        ("ASML","ASML Holding","NASDAQ","Technology","NL"),
+        ("AMAT","Applied Materials","NASDAQ","Technology","US"),
+        ("LRCX","Lam Research","NASDAQ","Technology","US"),
+        ("KLAC","KLA Corporation","NASDAQ","Technology","US"),
+        ("ADBE","Adobe Inc","NASDAQ","Technology","US"),
+        ("CRM","Salesforce Inc","NYSE","Technology","US"),
+        ("ORCL","Oracle Corporation","NYSE","Technology","US"),
+        ("SAP","SAP SE","NYSE","Technology","DE"),
+        ("NOW","ServiceNow Inc","NYSE","Technology","US"),
+        ("SNOW","Snowflake Inc","NYSE","Technology","US"),
+        ("PLTR","Palantir Technologies","NASDAQ","Technology","US"),
+        ("NFLX","Netflix Inc","NASDAQ","Communication","US"),
+        ("DIS","Walt Disney Co","NYSE","Communication","US"),
+        ("SPOT","Spotify Technology","NYSE","Communication","SE"),
+        ("SNAP","Snap Inc","NYSE","Communication","US"),
+        ("PINS","Pinterest Inc","NYSE","Communication","US"),
+        ("UBER","Uber Technologies","NYSE","Technology","US"),
+        ("LYFT","Lyft Inc","NASDAQ","Technology","US"),
+        ("SHOP","Shopify Inc","NYSE","Technology","CA"),
+        ("SQ","Block Inc","NYSE","Technology","US"),
+        ("COIN","Coinbase Global","NASDAQ","Financial","US"),
+        ("PYPL","PayPal Holdings","NASDAQ","Financial","US"),
+        # US — Finance
+        ("JPM","JPMorgan Chase","NYSE","Financial","US"),
+        ("BAC","Bank of America","NYSE","Financial","US"),
+        ("GS","Goldman Sachs","NYSE","Financial","US"),
+        ("MS","Morgan Stanley","NYSE","Financial","US"),
+        ("WFC","Wells Fargo","NYSE","Financial","US"),
+        ("C","Citigroup Inc","NYSE","Financial","US"),
+        ("V","Visa Inc","NYSE","Financial","US"),
+        ("MA","Mastercard Inc","NYSE","Financial","US"),
+        ("AXP","American Express","NYSE","Financial","US"),
+        ("BLK","BlackRock Inc","NYSE","Financial","US"),
+        ("SCHW","Charles Schwab","NYSE","Financial","US"),
+        # US — Healthcare
+        ("JNJ","Johnson & Johnson","NYSE","Healthcare","US"),
+        ("PFE","Pfizer Inc","NYSE","Healthcare","US"),
+        ("MRK","Merck & Co","NYSE","Healthcare","US"),
+        ("ABBV","AbbVie Inc","NYSE","Healthcare","US"),
+        ("LLY","Eli Lilly and Company","NYSE","Healthcare","US"),
+        ("UNH","UnitedHealth Group","NYSE","Healthcare","US"),
+        ("BMY","Bristol-Myers Squibb","NYSE","Healthcare","US"),
+        ("AMGN","Amgen Inc","NASDAQ","Healthcare","US"),
+        ("GILD","Gilead Sciences","NASDAQ","Healthcare","US"),
+        ("BIIB","Biogen Inc","NASDAQ","Healthcare","US"),
+        ("MRNA","Moderna Inc","NASDAQ","Healthcare","US"),
+        ("ISRG","Intuitive Surgical","NASDAQ","Healthcare","US"),
+        # US — Energy
+        ("XOM","Exxon Mobil Corp","NYSE","Energy","US"),
+        ("CVX","Chevron Corporation","NYSE","Energy","US"),
+        ("COP","ConocoPhillips","NYSE","Energy","US"),
+        ("SLB","SLB (Schlumberger)","NYSE","Energy","US"),
+        ("EOG","EOG Resources","NYSE","Energy","US"),
+        # US — Consumer
+        ("KO","Coca-Cola Company","NYSE","Consumer Defensive","US"),
+        ("PEP","PepsiCo Inc","NASDAQ","Consumer Defensive","US"),
+        ("WMT","Walmart Inc","NYSE","Consumer Defensive","US"),
+        ("COST","Costco Wholesale","NASDAQ","Consumer Defensive","US"),
+        ("MCD","McDonald's Corp","NYSE","Consumer Cyclical","US"),
+        ("SBUX","Starbucks Corp","NASDAQ","Consumer Cyclical","US"),
+        ("NKE","Nike Inc","NYSE","Consumer Cyclical","US"),
+        ("HD","Home Depot Inc","NYSE","Consumer Cyclical","US"),
+        ("LOW","Lowe's Companies","NYSE","Consumer Cyclical","US"),
+        ("AMZN","Amazon.com Inc","NASDAQ","Consumer Cyclical","US"),
+        # US — Industrial
+        ("BA","Boeing Company","NYSE","Industrials","US"),
+        ("CAT","Caterpillar Inc","NYSE","Industrials","US"),
+        ("GE","GE Aerospace","NYSE","Industrials","US"),
+        ("HON","Honeywell International","NASDAQ","Industrials","US"),
+        ("RTX","RTX Corporation","NYSE","Industrials","US"),
+        ("LMT","Lockheed Martin","NYSE","Industrials","US"),
+        ("NOC","Northrop Grumman","NYSE","Industrials","US"),
+        ("UPS","United Parcel Service","NYSE","Industrials","US"),
+        ("FDX","FedEx Corporation","NYSE","Industrials","US"),
+        # US — Real Estate & Utilities
+        ("AMT","American Tower Corp","NYSE","Real Estate","US"),
+        ("PLD","Prologis Inc","NYSE","Real Estate","US"),
+        ("NEE","NextEra Energy","NYSE","Utilities","US"),
+        # Israeli — NASDAQ/NYSE
+        ("CHKP","Check Point Software","NASDAQ","Technology","IL"),
+        ("NICE","NICE Systems Ltd","NASDAQ","Technology","IL"),
+        ("WIX","Wix.com Ltd","NASDAQ","Technology","IL"),
+        ("MNDY","Monday.com Ltd","NASDAQ","Technology","IL"),
+        ("GLBE","Global-E Online","NASDAQ","Technology","IL"),
+        ("CEVA","CEVA Inc","NASDAQ","Technology","IL"),
+        ("RDWR","Radware Ltd","NASDAQ","Technology","IL"),
+        ("TSEM","Tower Semiconductor","NASDAQ","Technology","IL"),
+        ("DOX","Amdocs Limited","NASDAQ","Technology","IL"),
+        ("ESLT","Elbit Systems of America","NASDAQ","Industrials","IL"),
+        # Israeli — TASE
+        ("TEVA.TA","Teva Pharmaceutical","TASE","Healthcare","IL"),
+        ("POLI.TA","Bank Hapoalim","TASE","Financial","IL"),
+        ("LUMI.TA","Bank Leumi","TASE","Financial","IL"),
+        ("DSCT.TA","Israel Discount Bank","TASE","Financial","IL"),
+        ("FIBI.TA","First International Bank","TASE","Financial","IL"),
+        ("MSBI.TA","Mizrahi Tefahot Bank","TASE","Financial","IL"),
+        ("ICL.TA","ICL Group (Israel Chemicals)","TASE","Materials","IL"),
+        ("ESLT.TA","Elbit Systems","TASE","Industrials","IL"),
+        ("BEZQ.TA","Bezeq Israeli Telecom","TASE","Communication","IL"),
+        ("NICE.TA","NICE Systems","TASE","Technology","IL"),
+        ("CHKP.TA","Check Point Software","TASE","Technology","IL"),
+        ("TSEM.TA","Tower Semiconductor","TASE","Technology","IL"),
+        ("ELAL.TA","El Al Israel Airlines","TASE","Industrials","IL"),
+        ("PHOE.TA","Phoenix Holdings","TASE","Financial","IL"),
+        ("CLAL.TA","Clal Insurance","TASE","Financial","IL"),
+        ("ENLT.TA","Enlight Renewable Energy","TASE","Utilities","IL"),
+        ("RDWR.TA","Radware Ltd","TASE","Technology","IL"),
+        # ETFs
+        ("SPY","SPDR S&P 500 ETF","NYSE","ETF","US"),
+        ("QQQ","Invesco QQQ Trust","NASDAQ","ETF","US"),
+        ("IWM","iShares Russell 2000","NYSE","ETF","US"),
+        ("GLD","SPDR Gold Shares","NYSE","ETF","US"),
+        ("TLT","iShares 20+ Year Treasury","NASDAQ","ETF","US"),
+        ("VIX","CBOE Volatility Index","CBOE","Index","US"),
+    ]
+    # Build search index: lowercase name + symbol → catalog entry
+    _CATALOG_IDX = []
+    for _c in CATALOG:
+        _CATALOG_IDX.append({
+            "symbol": _c[0], "name": _c[1], "exchange": _c[2],
+            "sector": _c[3], "country": _c[4]
+        })
+
+    def calc_rsi(closes, period=14):
+        """Relative Strength Index."""
+        try:
+            import pandas as pd
+            delta = closes.diff()
+            gain  = delta.clip(lower=0).rolling(period).mean()
+            loss  = (-delta.clip(upper=0)).rolling(period).mean()
+            rs    = gain.iloc[-1] / loss.iloc[-1]
+            return round(float(100 - 100 / (1 + rs)), 1) if loss.iloc[-1] != 0 else 100.0
+        except:
+            return None
+
+    def calc_macd(closes):
+        """MACD, Signal, Histogram."""
+        try:
+            ema12  = closes.ewm(span=12, adjust=False).mean()
+            ema26  = closes.ewm(span=26, adjust=False).mean()
+            macd   = ema12 - ema26
+            signal = macd.ewm(span=9, adjust=False).mean()
+            hist   = macd - signal
+            return {
+                "macd":   round(float(macd.iloc[-1]),   3),
+                "signal": round(float(signal.iloc[-1]), 3),
+                "hist":   round(float(hist.iloc[-1]),   3),
+                "trend":  "bullish" if hist.iloc[-1] > 0 else "bearish",
+            }
+        except:
+            return None
+
     def load_stock(sym):
         """Fetch 1yr history via yfinance, compute MAs and fundamentals."""
         global loading_set
@@ -58,6 +228,8 @@ data:
             ma50  = ma(50)
             ma100 = ma(100)
             ma200 = ma(200)
+            rsi  = calc_rsi(closes)
+            macd = calc_macd(closes)
             N = min(120, len(hist))
             def rolling_series(w):
                 r = closes.rolling(w).mean().iloc[-N:]
@@ -99,6 +271,12 @@ data:
                 "revenue_growth":round(float(info["revenueGrowth"]) * 100, 1) if info.get("revenueGrowth") else None,
                 "description":   (info.get("longBusinessSummary") or "")[:300],
                 "currency":      info.get("currency", "USD"),
+                "rec":           info.get("recommendationKey"),
+                "target_mean":   info.get("targetMeanPrice"),
+                "target_high":   info.get("targetHighPrice"),
+                "target_low":    info.get("targetLowPrice"),
+                "num_analysts":  info.get("numberOfAnalystOpinions"),
+                "strong_buy":    info.get("recommendationMean"),
             }
             raw_ccy = info.get("currency", "USD")
             # yfinance quotes some TASE stocks in ILA (Israeli Agoroth = 1/100 ILS)
@@ -116,6 +294,7 @@ data:
                 "volume":   int(hist["Volume"].iloc[-1]),
                 "name":     fund["name"], "sector": fund["sector"],
                 "currency": display_ccy,
+                "rsi":      rsi, "macd_data": macd,
                 "chart":    chart, "_ts": time.time(),
             }
             with data_lock:
@@ -171,6 +350,7 @@ data:
                         "ma50": d.get("ma50"), "ma100": d.get("ma100"), "ma200": d.get("ma200"),
                         "volume": d.get("volume", 0), "sector": d.get("sector", ""),
                         "currency": d.get("currency", "USD"),
+                        "rsi": d.get("rsi"), "macd_data": d.get("macd_data"),
                         "age_s": int(time.time() - d.get("_ts", 0)),
                     })
                 else:
@@ -193,6 +373,37 @@ data:
         if not d:
             return jsonify({"error": "not found or still loading"}), 404
         return jsonify({"symbol": symbol, **d, "fundamentals": f})
+
+    @app.route("/api/search")
+    def search_stocks():
+        q = (request.args.get("q") or "").strip()
+        if len(q) < 1:
+            return jsonify({"results": []})
+        qu = q.upper()
+        results = []
+        with stocks_lock:
+            wl = set(stocks)
+        for item in _CATALOG_IDX:
+            sym  = item["symbol"].upper()
+            name = item["name"].upper()
+            score = 0
+            if sym == qu:                          score = 100
+            elif sym.startswith(qu):               score = 85
+            elif qu in sym:                        score = 70
+            elif name.startswith(qu):              score = 55
+            elif qu in name:                       score = 40
+            else:
+                continue
+            results.append({**item, "score": score, "in_watchlist": item["symbol"] in wl})
+        results.sort(key=lambda x: -x["score"])
+        # Deduplicate by symbol
+        seen = set()
+        deduped = []
+        for r in results:
+            if r["symbol"] not in seen:
+                seen.add(r["symbol"])
+                deduped.append(r)
+        return jsonify({"results": deduped[:12]})
 
     @app.route("/api/stocks/add", methods=["POST"])
     def add_stock():
@@ -308,6 +519,73 @@ data:
     .exc-btn.active{background:#1f6feb;color:#fff}
     .exc-btn:hover:not(.active){background:#30363d;color:#e6edf3}
     .tase-badge{font-size:9px;background:#1f6feb22;color:#58a6ff;border:1px solid #1f6feb44;border-radius:3px;padding:0 3px;margin-left:3px;vertical-align:middle;font-weight:700}
+    /* ── Search bar (investing.com style) ── */
+    .search-wrap{position:relative;flex:1;max-width:420px}
+    .search-inp{width:100%;background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:7px 12px 7px 34px;border-radius:8px;font-size:13px;outline:none;transition:border .15s}
+    .search-inp:focus{border-color:#58a6ff}
+    .search-inp::placeholder{color:#8b949e}
+    .search-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:#8b949e;font-size:14px;pointer-events:none}
+    .search-drop{position:absolute;top:calc(100% + 6px);left:0;right:0;background:#161b22;border:1px solid #30363d;border-radius:10px;box-shadow:0 8px 32px #0008;z-index:999;max-height:380px;overflow-y:auto;display:none}
+    .search-drop.open{display:block}
+    .search-section{padding:6px 12px 2px;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.8px;font-weight:700;border-bottom:1px solid #21262d}
+    .search-item{display:flex;align-items:center;gap:8px;padding:9px 12px;cursor:pointer;transition:background .1s;border-bottom:1px solid #21262d0a}
+    .search-item:last-child{border-bottom:none}
+    .search-item:hover,.search-item.focused{background:#21262d}
+    .search-item.in-wl{opacity:.5}
+    .si-flag{font-size:15px;width:20px;text-align:center;flex-shrink:0}
+    .si-sym{font-size:13px;font-weight:700;color:#e6edf3;width:80px;flex-shrink:0}
+    .si-name{font-size:12px;color:#8b949e;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .si-exch{font-size:10px;background:#1f6feb22;color:#58a6ff;border:1px solid #1f6feb44;border-radius:4px;padding:1px 5px;font-weight:600;flex-shrink:0}
+    .si-sec{font-size:10px;color:#8b949e;flex-shrink:0;max-width:80px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .si-wl-tag{font-size:10px;color:#3fb950;flex-shrink:0}
+    /* ── RSI Bar ── */
+    .ti-label{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin:8px 0 4px;font-weight:600}
+    .rsi-wrap{margin-bottom:4px}
+    .rsi-track{position:relative;height:8px;border-radius:4px;background:linear-gradient(to right,#3fb950 0%,#3fb950 30%,#e6edf3 30%,#e6edf3 70%,#f85149 70%,#f85149 100%);margin-bottom:4px}
+    .rsi-marker{position:absolute;top:-3px;width:14px;height:14px;border-radius:50%;background:#fff;border:2px solid #161b22;box-shadow:0 0 4px #0006;transform:translateX(-50%);transition:left .3s}
+    .rsi-zones{display:flex;font-size:9px;color:#8b949e;justify-content:space-between;padding:0 1px}
+    .rsi-row{display:flex;align-items:center;gap:8px;margin-top:2px}
+    .rsi-num{font-size:18px;font-weight:700;min-width:44px}
+    .rsi-label{font-size:11px;padding:2px 8px;border-radius:4px;font-weight:600}
+    .rsi-os{background:#3fb95022;color:#3fb950}
+    .rsi-ob{background:#f8514922;color:#f85149}
+    .rsi-neu{background:#8b949e22;color:#8b949e}
+    /* ── MACD ── */
+    .ti-row{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:4px;margin-top:6px}
+    .ti-box{background:#161b22;border:1px solid #21262d;border-radius:6px;padding:5px 7px;text-align:center}
+    .ti-lab{font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px}
+    .ti-val{font-size:12px;font-weight:700}
+    /* ── 52W Range ── */
+    .range-wrap{display:flex;align-items:center;gap:6px;margin:4px 0}
+    .range-lo,.range-hi{font-size:10px;color:#8b949e;white-space:nowrap;min-width:44px}
+    .range-hi{text-align:right}
+    .range-track{flex:1;position:relative;height:6px;background:#21262d;border-radius:3px}
+    .range-fill{position:absolute;left:0;top:0;height:100%;background:linear-gradient(90deg,#f85149,#e6edf3,#3fb950);border-radius:3px}
+    .range-dot{position:absolute;top:-4px;width:14px;height:14px;border-radius:50%;background:#58a6ff;border:2px solid #161b22;transform:translateX(-50%);transition:left .3s}
+    .range-pct{font-size:10px;color:#8b949e;margin-bottom:4px}
+    /* ── Analyst ── */
+    .analyst-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:4px;margin:6px 0}
+    .analyst-pill{border-radius:5px;padding:5px 2px;text-align:center}
+    .analyst-pill .ap-cnt{font-size:14px;font-weight:700}
+    .analyst-pill .ap-lab{font-size:9px;text-transform:uppercase;letter-spacing:.3px;opacity:.8}
+    .ap-sb{background:#3fb95030;color:#3fb950}
+    .ap-b{background:#58a6ff30;color:#58a6ff}
+    .ap-h{background:#8b949e30;color:#8b949e}
+    .ap-s{background:#f0883e30;color:#f0883e}
+    .ap-ss{background:#f8514930;color:#f85149}
+    .analyst-target{font-size:12px;color:#e6edf3;margin:4px 0}
+    .analyst-bar{height:6px;border-radius:3px;background:#21262d;margin:6px 0;overflow:hidden;display:flex}
+    .ab-buy{background:#3fb950;transition:width .3s}
+    .ab-hold{background:#8b949e;transition:width .3s}
+    .ab-sell{background:#f85149;transition:width .3s}
+    .analyst-rec-badge{display:inline-block;border-radius:6px;padding:3px 10px;font-size:12px;font-weight:700;margin-top:4px}
+    .rec-strong-buy{background:#3fb95030;color:#3fb950;border:1px solid #3fb95066}
+    .rec-buy{background:#58a6ff30;color:#58a6ff;border:1px solid #58a6ff66}
+    .rec-hold{background:#8b949e30;color:#8b949e;border:1px solid #8b949e66}
+    .rec-sell{background:#f8514930;color:#f85149;border:1px solid #f8514966}
+    .rec-strong-sell{background:#f8514950;color:#f85149;border:1px solid #f85149}
+    .earnings-row{font-size:11px;color:#8b949e;margin-top:4px}
+    .earnings-date{color:#f0883e;font-weight:600}
     .nav-right{display:flex;align-items:center;gap:10px;margin-left:auto}
     .clock{color:#8b949e;font-size:12px;font-variant-numeric:tabular-nums}
     .bal-box{background:#3fb95015;border:1px solid #3fb95044;border-radius:6px;padding:4px 12px;text-align:center}
@@ -388,13 +666,12 @@ data:
     <body>
     <nav>
       <div class="logo">Trader<span>Pro</span></div>
-      <div class="add-form">
-        <div class="exchange-toggle">
-          <button class="exc-btn active" id="exc-nasdaq" onclick="setExch('NASDAQ')">NASDAQ</button>
-          <button class="exc-btn" id="exc-tase" onclick="setExch('TASE')">🇮🇱 TASE</button>
-        </div>
-        <input class="add-input" id="add-sym" placeholder="AAPL, TSLA…" maxlength="12">
-        <button class="btn-add" onclick="addStock()">+ Add</button>
+      <div class="search-wrap" id="search-wrap">
+        <span class="search-icon">🔍</span>
+        <input class="search-inp" id="search-inp"
+          placeholder="Search stocks — AAPL, Apple, TEVA…"
+          autocomplete="off" spellcheck="false">
+        <div class="search-drop" id="search-drop"></div>
       </div>
       <div class="nav-right">
         <div class="clock" id="clock">00:00:00</div>
@@ -458,6 +735,50 @@ data:
           <div id="f-sector"></div>
           <div class="desc" id="f-desc"></div>
         </div>
+        <!-- Technical Indicators -->
+        <div class="dp-section">
+          <div class="dp-title">Technical Indicators</div>
+          <div class="ti-label">RSI (14-day)</div>
+          <div class="rsi-wrap">
+            <div class="rsi-track"><div class="rsi-marker" id="rsi-marker" style="left:50%"></div></div>
+            <div class="rsi-zones"><span>0</span><span>Oversold 30</span><span style="flex:4;text-align:center">Neutral</span><span>70 Overbought</span><span>100</span></div>
+          </div>
+          <div class="rsi-row">
+            <div class="rsi-num" id="rsi-num">—</div>
+            <div class="rsi-label rsi-neu" id="rsi-lbl">—</div>
+          </div>
+          <div class="ti-label" style="margin-top:10px">MACD (12,26,9)</div>
+          <div class="ti-row">
+            <div class="ti-box"><div class="ti-lab">MACD</div><div class="ti-val" id="macd-v">—</div></div>
+            <div class="ti-box"><div class="ti-lab">Signal</div><div class="ti-val" id="macd-s">—</div></div>
+            <div class="ti-box"><div class="ti-lab">Hist</div><div class="ti-val" id="macd-h">—</div></div>
+            <div class="ti-box"><div class="ti-lab">Trend</div><div class="ti-val" id="macd-t">—</div></div>
+          </div>
+          <div class="ti-label" style="margin-top:10px">52-Week Range</div>
+          <div class="range-wrap">
+            <span class="range-lo" id="rng-lo">—</span>
+            <div class="range-track" id="rng-track">
+              <div class="range-dot" id="rng-dot" style="left:50%"></div>
+            </div>
+            <span class="range-hi" id="rng-hi">—</span>
+          </div>
+          <div class="range-pct" id="rng-pct"></div>
+        </div>
+        <!-- Analyst Ratings -->
+        <div class="dp-section">
+          <div class="dp-title">Analyst Ratings</div>
+          <div class="analyst-grid" id="analyst-grid">
+            <div class="analyst-pill ap-sb"><div class="ap-cnt" id="an-sb">—</div><div class="ap-lab">St.Buy</div></div>
+            <div class="analyst-pill ap-b"><div class="ap-cnt" id="an-b">—</div><div class="ap-lab">Buy</div></div>
+            <div class="analyst-pill ap-h"><div class="ap-cnt" id="an-h">—</div><div class="ap-lab">Hold</div></div>
+            <div class="analyst-pill ap-s"><div class="ap-cnt" id="an-s">—</div><div class="ap-lab">Sell</div></div>
+            <div class="analyst-pill ap-ss"><div class="ap-cnt" id="an-ss">—</div><div class="ap-lab">St.Sell</div></div>
+          </div>
+          <div class="analyst-bar"><div class="ab-buy" id="ab-buy"></div><div class="ab-hold" id="ab-hold"></div><div class="ab-sell" id="ab-sell"></div></div>
+          <div class="analyst-target" id="analyst-target"></div>
+          <div id="analyst-rec"></div>
+          <div class="earnings-row" id="earnings-row"></div>
+        </div>
         <!-- Trade -->
         <div class="dp-section">
           <div class="dp-title">Place Order — <span id="trade-sym">—</span></div>
@@ -498,14 +819,6 @@ data:
     let sel = null;
     let chart = null;
     let pnl = 0, trades = 0;
-    let exchMode = 'NASDAQ';
-
-    function setExch(mode) {
-      exchMode = mode;
-      document.querySelectorAll('.exc-btn').forEach(b => b.classList.remove('active'));
-      document.getElementById('exc-' + mode.toLowerCase()).classList.add('active');
-      document.getElementById('add-sym').placeholder = mode === 'TASE' ? 'TEVA, NICE, POLI…' : 'AAPL, TSLA…';
-    }
 
     // Currency symbol helper — uses stored currency from API, falls back to .TA heuristic
     const CCY_MAP = { USD:'$', ILS:'₪', ILA:'₪', EUR:'€', GBP:'£', JPY:'¥', CAD:'$', AUD:'$' };
@@ -516,6 +829,108 @@ data:
     }
     // Display name — strip .TA suffix for cleaner watchlist
     function dispSym(sym) { return sym && sym.endsWith('.TA') ? sym.slice(0, -3) : sym; }
+
+    // ── Investing.com-style search ────────────────────────────────────
+    const FLAG = { US:'🇺🇸', IL:'🇮🇱', NL:'🇳🇱', DE:'🇩🇪', CA:'🇨🇦', SE:'🇸🇪', GB:'🇬🇧' };
+    let searchTimer = null;
+    let dropFocus   = -1;
+    let dropItems   = [];
+
+    const searchInp  = document.getElementById('search-inp');
+    const searchDrop = document.getElementById('search-drop');
+
+    function closeSearch() {
+      searchDrop.classList.remove('open');
+      dropFocus = -1;
+      dropItems = [];
+    }
+
+    function renderDropdown(results) {
+      if (!results.length) { closeSearch(); return; }
+      dropItems = results;
+      dropFocus = -1;
+      const html = results.map((r, i) => {
+        const flag   = FLAG[r.country] || '🌐';
+        const wl     = r.in_watchlist ? '<span class="si-wl-tag">✓ added</span>' : '';
+        const cls    = r.in_watchlist ? ' in-wl' : '';
+        return `<div class="search-item${cls}" data-i="${i}" onmousedown="pickFromDrop(${i})">
+          <span class="si-flag">${flag}</span>
+          <span class="si-sym">${r.symbol}</span>
+          <span class="si-name">${r.name}</span>
+          <span class="si-exch">${r.exchange}</span>
+          <span class="si-sec">${r.sector||''}</span>
+          ${wl}
+        </div>`;
+      }).join('');
+      searchDrop.innerHTML = html;
+      searchDrop.classList.add('open');
+    }
+
+    async function doSearch(q) {
+      if (q.length < 1) { closeSearch(); return; }
+      try {
+        const r = await fetch(API + '/search?q=' + encodeURIComponent(q));
+        const d = await r.json();
+        renderDropdown(d.results || []);
+      } catch(e) { closeSearch(); }
+    }
+
+    searchInp.addEventListener('input', e => {
+      clearTimeout(searchTimer);
+      const q = e.target.value.trim();
+      if (!q) { closeSearch(); return; }
+      searchTimer = setTimeout(() => doSearch(q), 180);
+    });
+
+    searchInp.addEventListener('keydown', e => {
+      if (!searchDrop.classList.contains('open')) return;
+      const items = searchDrop.querySelectorAll('.search-item');
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        dropFocus = Math.min(dropFocus + 1, items.length - 1);
+        items.forEach((el,i) => el.classList.toggle('focused', i === dropFocus));
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        dropFocus = Math.max(dropFocus - 1, 0);
+        items.forEach((el,i) => el.classList.toggle('focused', i === dropFocus));
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (dropFocus >= 0 && dropItems[dropFocus]) pickFromDrop(dropFocus);
+        else if (dropItems[0]) pickFromDrop(0);
+      } else if (e.key === 'Escape') {
+        closeSearch();
+      }
+    });
+
+    document.addEventListener('click', e => {
+      if (!document.getElementById('search-wrap').contains(e.target)) closeSearch();
+    });
+
+    async function pickFromDrop(i) {
+      const item = dropItems[i];
+      if (!item) return;
+      closeSearch();
+      searchInp.value = '';
+      await addStockBySymbol(item.symbol);
+    }
+
+    async function addStockBySymbol(sym) {
+      if (stocks[sym]) { selectStock(sym); return; }
+      stocks[sym] = { symbol: sym, loading: true };
+      renderWatchlist();
+      try {
+        const r = await fetch(API + '/stocks/add', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ symbol: sym })
+        });
+        const j = await r.json();
+        if (j.status === 'error') {
+          delete stocks[sym];
+          renderWatchlist();
+          alert('Symbol not found: ' + sym);
+        }
+      } catch(e) { console.error(e); }
+    }
 
     // Clock
     function tick() {
@@ -629,6 +1044,8 @@ data:
         updateChartHeader();
         renderChart(d);
         renderFundamentals(d.fundamentals || {});
+        renderTechnicals(d);
+        renderAnalyst(d.fundamentals || {});
       } catch(e) { console.error(e); }
     }
 
@@ -697,31 +1114,80 @@ data:
       document.getElementById('f-desc').textContent = f.description || '';
     }
 
-    // Add stock
-    async function addStock() {
-      const inp = document.getElementById('add-sym');
-      let sym = inp.value.trim().toUpperCase().replace(/\s+/g, '');
-      if (!sym) return;
-      // Auto-append .TA suffix for Tel Aviv exchange
-      if (exchMode === 'TASE' && !sym.endsWith('.TA')) sym += '.TA';
-      if (stocks[sym]) { inp.value = ''; return; }  // already in list
-      stocks[sym] = { symbol: sym, loading: true };
-      renderWatchlist();
-      inp.value = '';
-      try {
-        const r = await fetch(API + '/stocks/add', {
-          method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ symbol: sym })
-        });
-        const j = await r.json();
-        if (j.status === 'error') {
-          delete stocks[sym];
-          renderWatchlist();
-          alert('Symbol not found: ' + sym);
-        }
-      } catch(e) { console.error(e); }
+    function renderTechnicals(d) {
+      const c = ccy(sel);
+      const f = d.fundamentals || {};
+      // ── RSI ──
+      const rsi = d.rsi;
+      if (rsi != null) {
+        const pct = Math.min(Math.max(rsi, 0), 100);
+        document.getElementById('rsi-marker').style.left = pct + '%';
+        document.getElementById('rsi-num').textContent = rsi.toFixed(1);
+        const lbl = document.getElementById('rsi-lbl');
+        if (rsi < 30)       { lbl.textContent = 'Oversold';   lbl.className = 'rsi-label rsi-os'; }
+        else if (rsi > 70)  { lbl.textContent = 'Overbought'; lbl.className = 'rsi-label rsi-ob'; }
+        else                { lbl.textContent = 'Neutral';    lbl.className = 'rsi-label rsi-neu'; }
+        document.getElementById('rsi-num').style.color = rsi < 30 ? '#3fb950' : rsi > 70 ? '#f85149' : '#e6edf3';
+      }
+      // ── MACD ──
+      const m = d.macd_data;
+      if (m) {
+        const pos = v => v > 0 ? '#3fb950' : '#f85149';
+        document.getElementById('macd-v').textContent = m.macd;
+        document.getElementById('macd-v').style.color = pos(m.macd);
+        document.getElementById('macd-s').textContent = m.signal;
+        document.getElementById('macd-s').style.color = pos(m.signal);
+        document.getElementById('macd-h').textContent = m.hist;
+        document.getElementById('macd-h').style.color = pos(m.hist);
+        const t = document.getElementById('macd-t');
+        t.textContent = m.trend === 'bullish' ? '▲ Bull' : '▼ Bear';
+        t.style.color = m.trend === 'bullish' ? '#3fb950' : '#f85149';
+      }
+      // ── 52W Range ──
+      const lo = f.low_52w, hi = f.high_52w, p = d.price;
+      if (lo && hi && p && hi > lo) {
+        const pct = Math.min(Math.max((p - lo) / (hi - lo) * 100, 2), 98);
+        document.getElementById('rng-lo').textContent = c + fmt(lo);
+        document.getElementById('rng-hi').textContent = c + fmt(hi);
+        document.getElementById('rng-dot').style.left  = pct + '%';
+        const fromHi = ((hi - p) / hi * 100).toFixed(1);
+        document.getElementById('rng-pct').textContent = fromHi + '% from 52W High';
+      }
     }
-    document.getElementById('add-sym').addEventListener('keydown', e => { if (e.key === 'Enter') addStock(); });
+
+    function renderAnalyst(f) {
+      if (!f || !f.rec) return;
+      const c = ccy(sel);
+      // Rating badge
+      const recMap = {
+        'strong_buy':'Strong Buy','buy':'Buy','hold':'Hold',
+        'underperform':'Underperform','sell':'Sell','strong_sell':'Strong Sell'
+      };
+      const clsMap = {
+        'strong_buy':'rec-strong-buy','buy':'rec-buy','hold':'rec-hold',
+        'underperform':'rec-sell','sell':'rec-sell','strong_sell':'rec-strong-sell'
+      };
+      const recKey = f.rec.toLowerCase().replace(/ /g,'_');
+      const recEl  = document.getElementById('analyst-rec');
+      recEl.innerHTML = `<span class="analyst-rec-badge ${clsMap[recKey]||'rec-hold'}">${recMap[recKey]||f.rec}</span>`;
+      // Target price
+      if (f.target_mean) {
+        document.getElementById('analyst-target').innerHTML =
+          `Price Target: <strong style="color:#58a6ff">${c}${fmt(f.target_mean)}</strong>` +
+          (f.target_low && f.target_high
+            ? ` <span style="color:#8b949e;font-size:11px">( Low: ${c}${fmt(f.target_low)} / High: ${c}${fmt(f.target_high)} )</span>` : '');
+      }
+      // Analyst count bar (estimate from recommendationMean: 1=strong buy, 5=strong sell)
+      const mean = f.strong_buy;  // actually recommendationMean
+      if (mean != null) {
+        const buyPct  = Math.max(0, Math.min(100, ((5 - mean) / 4) * 100));
+        const sellPct = Math.max(0, Math.min(100, ((mean - 1) / 4) * 100));
+        const holdPct = 100 - buyPct - sellPct;
+        document.getElementById('ab-buy').style.width  = buyPct + '%';
+        document.getElementById('ab-hold').style.width = Math.max(holdPct, 0) + '%';
+        document.getElementById('ab-sell').style.width = sellPct + '%';
+      }
+    }
 
     // Remove stock
     async function removeStock(sym) {
