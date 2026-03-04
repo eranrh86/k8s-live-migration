@@ -418,6 +418,15 @@ data:
             return jsonify({"error": "not found or still loading"}), 404
         return jsonify({"symbol": symbol, **d, "fundamentals": f})
 
+    @app.route("/api/catalog")
+    def get_catalog():
+        with stocks_lock:
+            wl = set(stocks)
+        return jsonify({"catalog": [
+            {**item, "in_watchlist": item["symbol"] in wl}
+            for item in _CATALOG_IDX
+        ]})
+
     @app.route("/api/search")
     def search_stocks():
         q = (request.args.get("q") or "").strip()
@@ -553,36 +562,28 @@ data:
     /* NAV */
     nav{background:#161b22;border-bottom:1px solid #30363d;height:52px;display:flex;align-items:center;padding:0 16px;gap:12px;flex-shrink:0;z-index:10}
     .logo{font-size:18px;font-weight:700;color:#58a6ff;letter-spacing:-.5px;white-space:nowrap}.logo span{color:#3fb950}
-    .add-form{display:flex;gap:6px;flex:1;max-width:340px}
-    .add-input{background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:6px 10px;border-radius:6px;font-size:13px;width:100px;text-transform:uppercase}
-    .add-input:focus{outline:none;border-color:#58a6ff}
-    .add-input::placeholder{text-transform:none;color:#8b949e}
-    .btn-add{background:#1f6feb;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
-    .btn-add:hover{background:#388bfd}
-    .exchange-toggle{display:flex;border:1px solid #30363d;border-radius:6px;overflow:hidden;flex-shrink:0}
-    .exc-btn{background:#21262d;color:#8b949e;border:none;padding:5px 9px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;transition:all .15s}
-    .exc-btn.active{background:#1f6feb;color:#fff}
-    .exc-btn:hover:not(.active){background:#30363d;color:#e6edf3}
     .tase-badge{font-size:9px;background:#1f6feb22;color:#58a6ff;border:1px solid #1f6feb44;border-radius:3px;padding:0 3px;margin-left:3px;vertical-align:middle;font-weight:700}
-    /* ── Search bar (investing.com style) ── */
-    .search-wrap{position:relative;flex:1;max-width:420px}
-    .search-inp{width:100%;background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:7px 12px 7px 34px;border-radius:8px;font-size:13px;outline:none;transition:border .15s}
-    .search-inp:focus{border-color:#58a6ff}
+    /* ── Search engine (primary stock discovery) ── */
+    .search-wrap{position:relative;flex:1;max-width:640px}
+    .search-inp{width:100%;background:#0d1117;border:1.5px solid #30363d;color:#e6edf3;padding:9px 14px 9px 38px;border-radius:10px;font-size:14px;outline:none;transition:border .15s,box-shadow .15s}
+    .search-inp:focus{border-color:#58a6ff;box-shadow:0 0 0 3px #58a6ff18}
     .search-inp::placeholder{color:#8b949e}
-    .search-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:#8b949e;font-size:14px;pointer-events:none}
-    .search-drop{position:absolute;top:calc(100% + 6px);left:0;right:0;background:#161b22;border:1px solid #30363d;border-radius:10px;box-shadow:0 8px 32px #0008;z-index:999;max-height:380px;overflow-y:auto;display:none}
+    .search-icon{position:absolute;left:11px;top:50%;transform:translateY(-50%);color:#8b949e;font-size:15px;pointer-events:none}
+    .search-drop{position:absolute;top:calc(100% + 6px);left:0;right:0;background:#161b22;border:1px solid #30363d;border-radius:12px;box-shadow:0 12px 40px #000a;z-index:999;max-height:420px;overflow-y:auto;display:none}
     .search-drop.open{display:block}
-    .search-section{padding:6px 12px 2px;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.8px;font-weight:700;border-bottom:1px solid #21262d}
-    .search-item{display:flex;align-items:center;gap:8px;padding:9px 12px;cursor:pointer;transition:background .1s;border-bottom:1px solid #21262d0a}
+    .search-section{padding:7px 14px 3px;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.9px;font-weight:700;border-bottom:1px solid #21262d}
+    .search-item{display:flex;align-items:center;gap:9px;padding:10px 14px;cursor:pointer;transition:background .1s;border-bottom:1px solid #21262d0a}
     .search-item:last-child{border-bottom:none}
     .search-item:hover,.search-item.focused{background:#21262d}
-    .search-item.in-wl{opacity:.5}
-    .si-flag{font-size:15px;width:20px;text-align:center;flex-shrink:0}
-    .si-sym{font-size:13px;font-weight:700;color:#e6edf3;width:80px;flex-shrink:0}
+    .search-item.in-wl .si-sym{color:#58a6ff}
+    .si-flag{font-size:16px;width:22px;text-align:center;flex-shrink:0}
+    .si-sym{font-size:13px;font-weight:700;color:#e6edf3;width:85px;flex-shrink:0}
     .si-name{font-size:12px;color:#8b949e;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .si-exch{font-size:10px;background:#1f6feb22;color:#58a6ff;border:1px solid #1f6feb44;border-radius:4px;padding:1px 5px;font-weight:600;flex-shrink:0}
-    .si-sec{font-size:10px;color:#8b949e;flex-shrink:0;max-width:80px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .si-wl-tag{font-size:10px;color:#3fb950;flex-shrink:0}
+    .si-exch{font-size:10px;background:#1f6feb22;color:#58a6ff;border:1px solid #1f6feb44;border-radius:4px;padding:1px 6px;font-weight:600;flex-shrink:0}
+    .si-sec{font-size:10px;color:#8b949e;flex-shrink:0;max-width:90px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .si-wl-tag{font-size:10px;background:#3fb95022;color:#3fb950;border:1px solid #3fb95044;border-radius:4px;padding:1px 5px;flex-shrink:0;font-weight:600}
+    .si-add-hint{font-size:10px;color:#8b949e66;flex-shrink:0;display:none}
+    .search-item:hover .si-add-hint,.search-item.focused .si-add-hint{display:block}
     /* ── RSI Bar ── */
     .ti-label{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin:8px 0 4px;font-weight:600}
     .rsi-wrap{margin-bottom:4px}
@@ -633,9 +634,6 @@ data:
     .earnings-date{color:#f0883e;font-weight:600}
     .nav-right{display:flex;align-items:center;gap:10px;margin-left:auto}
     .clock{color:#8b949e;font-size:12px;font-variant-numeric:tabular-nums}
-    .bal-box{background:#3fb95015;border:1px solid #3fb95044;border-radius:6px;padding:4px 12px;text-align:center}
-    .bal-label{font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px}
-    .bal-val{font-size:15px;font-weight:700;color:#3fb950}
     /* TICKER */
     .ticker{background:#0d1117;border-bottom:1px solid #21262d;height:28px;overflow:hidden;white-space:nowrap;flex-shrink:0}
     .ticker-inner{display:inline-flex;animation:scroll 50s linear infinite}
@@ -688,19 +686,7 @@ data:
     .sector-badge{display:inline-block;background:#1f6feb20;border:1px solid #1f6feb44;color:#58a6ff;border-radius:12px;padding:3px 10px;font-size:11px;font-weight:600;margin-top:4px}
     .desc{font-size:11px;color:#8b949e;line-height:1.5;margin-top:6px}
     /* TRADE */
-    .qty-row{display:flex;gap:6px;align-items:center;margin-bottom:8px}
-    .qty-label{font-size:11px;color:#8b949e;width:50px}
-    .qty-input{flex:1;background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:5px 8px;border-radius:5px;font-size:13px}
-    .trade-btns{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-    .btn-buy{background:#3fb950;color:#fff;border:none;border-radius:6px;padding:9px;font-size:13px;font-weight:700;cursor:pointer}
-    .btn-sell{background:#f85149;color:#fff;border:none;border-radius:6px;padding:9px;font-size:13px;font-weight:700;cursor:pointer}
-    .btn-buy:hover{opacity:.85}.btn-sell:hover{opacity:.85}
-    .trade-msg{font-size:11px;color:#8b949e;text-align:center;margin-top:5px;min-height:16px}
     /* PNL */
-    .pnl-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-    .pnl-box{background:#161b22;border:1px solid #21262d;border-radius:6px;padding:8px 10px}
-    .pnl-label{font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.3px}
-    .pnl-val{font-size:14px;font-weight:700;margin-top:2px;font-variant-numeric:tabular-nums}
     /* MIG STATUS */
     .mig-row{display:flex;justify-content:space-between;padding:4px 0;font-size:11px;border-bottom:1px solid #21262d0a}
     .mig-key{color:#8b949e}.mig-val{color:#58a6ff;font-family:monospace;font-size:10px}
@@ -714,13 +700,12 @@ data:
       <div class="search-wrap" id="search-wrap">
         <span class="search-icon">🔍</span>
         <input class="search-inp" id="search-inp"
-          placeholder="Search stocks — AAPL, Apple, TEVA…"
+          placeholder="Search stocks, crypto, gold… AAPL, Bitcoin, Datadog, USD/ILS"
           autocomplete="off" spellcheck="false">
         <div class="search-drop" id="search-drop"></div>
       </div>
       <div class="nav-right">
         <div class="clock" id="clock">00:00:00</div>
-        <div class="bal-box"><div class="bal-label">Equity</div><div class="bal-val" id="nav-bal">$125,000</div></div>
       </div>
     </nav>
     <div class="ticker"><div class="ticker-inner" id="ticker"></div></div>
@@ -825,29 +810,6 @@ data:
           <div id="analyst-rec"></div>
           <div class="earnings-row" id="earnings-row"></div>
         </div>
-        <!-- Trade -->
-        <div class="dp-section">
-          <div class="dp-title">Place Order — <span id="trade-sym">—</span></div>
-          <div class="qty-row">
-            <span class="qty-label">Qty</span>
-            <input class="qty-input" id="qty" type="number" value="10" min="1">
-          </div>
-          <div class="trade-btns">
-            <button class="btn-buy" onclick="executeTrade('BUY')">BUY</button>
-            <button class="btn-sell" onclick="executeTrade('SELL')">SELL</button>
-          </div>
-          <div class="trade-msg" id="trade-msg"></div>
-        </div>
-        <!-- P&L -->
-        <div class="dp-section">
-          <div class="dp-title">Account</div>
-          <div class="pnl-grid">
-            <div class="pnl-box"><div class="pnl-label">Total P&L</div><div class="pnl-val green" id="p-pnl">+$0</div></div>
-            <div class="pnl-box"><div class="pnl-label">Trades</div><div class="pnl-val" id="p-trades">0</div></div>
-            <div class="pnl-box"><div class="pnl-label">Balance</div><div class="pnl-val" id="p-bal">$125,000</div></div>
-            <div class="pnl-box"><div class="pnl-label">Requests</div><div class="pnl-val blue" id="p-rc" style="color:#58a6ff">0</div></div>
-          </div>
-        </div>
         <!-- Migration status -->
         <div class="dp-section">
           <div class="dp-title"><span class="live-dot"></span>Live Pod</div>
@@ -864,7 +826,6 @@ data:
     let stocks = {};
     let sel = null;
     let chart = null;
-    let pnl = 0, trades = 0;
 
     // Currency symbol helper — uses stored currency from API, falls back to .TA heuristic
     const CCY_MAP = { USD:'$', ILS:'₪', ILA:'₪', EUR:'€', GBP:'£', JPY:'¥', CAD:'$', AUD:'$' };
@@ -883,11 +844,13 @@ data:
       return M[sym] || sym;
     }
 
-    // ── Investing.com-style search ────────────────────────────────────
-    const FLAG = { US:'🇺🇸', IL:'🇮🇱', NL:'🇳🇱', DE:'🇩🇪', CA:'🇨🇦', SE:'🇸🇪', GB:'🇬🇧' };
+    // ── Stock Search Engine ────────────────────────────────────────────
+    const FLAG = { US:'🇺🇸', IL:'🇮🇱', NL:'🇳🇱', DE:'🇩🇪', CA:'🇨🇦', SE:'🇸🇪', GB:'🇬🇧',
+                   JP:'🇯🇵', AU:'🇦🇺', EU:'🇪🇺', IE:'🇮🇪', Global:'🌐' };
     let searchTimer = null;
     let dropFocus   = -1;
     let dropItems   = [];
+    let _catalogCache = [];
 
     const searchInp  = document.getElementById('search-inp');
     const searchDrop = document.getElementById('search-drop');
@@ -898,13 +861,14 @@ data:
       dropItems = [];
     }
 
-    function renderDropdown(results) {
+    function renderDropdown(results, sectionLabel) {
       if (!results.length) { closeSearch(); return; }
       dropItems = results;
       dropFocus = -1;
-      const html = results.map((r, i) => {
+      let html = sectionLabel ? `<div class="search-section">${sectionLabel}</div>` : '';
+      html += results.map((r, i) => {
         const flag   = FLAG[r.country] || '🌐';
-        const wl     = r.in_watchlist ? '<span class="si-wl-tag">✓ added</span>' : '';
+        const wl     = r.in_watchlist ? '<span class="si-wl-tag">✓ In watchlist</span>' : '<span class="si-add-hint">↵ Add</span>';
         const cls    = r.in_watchlist ? ' in-wl' : '';
         return `<div class="search-item${cls}" data-i="${i}" onmousedown="pickFromDrop(${i})">
           <span class="si-flag">${flag}</span>
@@ -920,18 +884,32 @@ data:
     }
 
     async function doSearch(q) {
-      if (q.length < 1) { closeSearch(); return; }
+      if (q.length < 1) { showPopular(); return; }
       try {
         const r = await fetch(API + '/search?q=' + encodeURIComponent(q));
         const d = await r.json();
-        renderDropdown(d.results || []);
+        renderDropdown(d.results || [], null);
       } catch(e) { closeSearch(); }
     }
+
+    async function showPopular() {
+      const POPULAR = ['AAPL','TSLA','NVDA','BTC-USD','ETH-USD','GC=F','MSFT','AMZN','META','GOOGL','ILS=X','SI=F'];
+      const wl = new Set(Object.keys(stocks));
+      const items = POPULAR.map(sym => {
+        const found = _catalogCache.find(c => c.symbol === sym);
+        return found ? {...found, in_watchlist: wl.has(sym)} : null;
+      }).filter(Boolean);
+      renderDropdown(items, '⭐ Popular');
+    }
+
+    searchInp.addEventListener('focus', () => {
+      if (!searchInp.value.trim()) showPopular();
+    });
 
     searchInp.addEventListener('input', e => {
       clearTimeout(searchTimer);
       const q = e.target.value.trim();
-      if (!q) { closeSearch(); return; }
+      if (!q) { showPopular(); return; }
       searchTimer = setTimeout(() => doSearch(q), 180);
     });
 
@@ -1092,7 +1070,6 @@ data:
     // Select stock → fetch detail + render chart + fundamentals
     async function selectStock(sym) {
       sel = sym;
-      document.getElementById('trade-sym').textContent = sym;
       renderWatchlist();
       document.getElementById('chart-empty').style.display = 'none';
       try {
@@ -1260,35 +1237,18 @@ data:
       } catch(e) { console.error(e); }
     }
 
-    // Trade
-    async function executeTrade(side) {
-      if (!sel) return;
-      const qty = parseInt(document.getElementById('qty').value) || 10;
-      try {
-        const r  = await fetch(API + '/trade', {
-          method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ symbol: sel, qty })
-        });
-        const d  = await r.json();
-        pnl    = d.pnl; trades = d.trades;
-        const g  = d.gain;
-        const sp = g >= 0 ? '+' : '';
-        document.getElementById('trade-msg').textContent =
-          `${side} ${qty}×${sel}  ${sp}$${fmt(Math.abs(g))}`;
-        const pnlEl = document.getElementById('p-pnl');
-        pnlEl.textContent = (pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(pnl));
-        pnlEl.className   = 'pnl-val ' + (pnl >= 0 ? 'green' : 'red');
-        document.getElementById('p-trades').textContent = trades;
-        const bal = 125000 + pnl;
-        document.getElementById('p-bal').textContent   = '$' + fmt(bal);
-        document.getElementById('nav-bal').textContent = '$' + fmt(bal);
-        setTimeout(() => document.getElementById('trade-msg').textContent = '', 3000);
-      } catch(e) { console.error(e); }
-    }
 
-    // Boot
+    // Boot — load full catalog once for instant Popular list
+    async function bootCatalog() {
+      try {
+        const r = await fetch(API + '/catalog');
+        const d = await r.json();
+        _catalogCache = d.catalog || [];
+      } catch(e) {}
+    }
     fetchStocks();
     setInterval(fetchStocks, 8000);
+    bootCatalog();
     </script>
     </body>
     </html>
