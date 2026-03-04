@@ -157,13 +157,55 @@ data:
         ("CLAL.TA","Clal Insurance","TASE","Financial","IL"),
         ("ENLT.TA","Enlight Renewable Energy","TASE","Utilities","IL"),
         ("RDWR.TA","Radware Ltd","TASE","Technology","IL"),
+        # US — More Tech / Cloud / Security
+        ("DDOG","Datadog Inc","NASDAQ","Technology","US"),
+        ("CRWD","CrowdStrike Holdings","NASDAQ","Technology","US"),
+        ("ZS","Zscaler Inc","NASDAQ","Technology","US"),
+        ("PANW","Palo Alto Networks","NASDAQ","Technology","US"),
+        ("NET","Cloudflare Inc","NYSE","Technology","US"),
+        ("OKTA","Okta Inc","NASDAQ","Technology","US"),
+        ("MDB","MongoDB Inc","NASDAQ","Technology","US"),
+        ("TTD","The Trade Desk","NASDAQ","Technology","US"),
+        ("RBLX","Roblox Corp","NYSE","Communication","US"),
+        ("ROKU","Roku Inc","NASDAQ","Communication","US"),
+        ("ABNB","Airbnb Inc","NASDAQ","Consumer Cyclical","US"),
+        ("DASH","DoorDash Inc","NYSE","Consumer Cyclical","US"),
+        ("ARM","Arm Holdings","NASDAQ","Technology","GB"),
+        ("SMCI","Super Micro Computer","NASDAQ","Technology","US"),
+        ("DELL","Dell Technologies","NYSE","Technology","US"),
+        ("HPQ","HP Inc","NYSE","Technology","US"),
+        ("CSCO","Cisco Systems","NASDAQ","Technology","US"),
+        ("IBM","IBM Corporation","NYSE","Technology","US"),
+        ("ACN","Accenture plc","NYSE","Technology","IE"),
         # ETFs
         ("SPY","SPDR S&P 500 ETF","NYSE","ETF","US"),
         ("QQQ","Invesco QQQ Trust","NASDAQ","ETF","US"),
         ("IWM","iShares Russell 2000","NYSE","ETF","US"),
         ("GLD","SPDR Gold Shares","NYSE","ETF","US"),
+        ("SLV","iShares Silver Trust","NYSE","ETF","US"),
+        ("USO","United States Oil Fund","NYSE","ETF","US"),
         ("TLT","iShares 20+ Year Treasury","NASDAQ","ETF","US"),
         ("VIX","CBOE Volatility Index","CBOE","Index","US"),
+        # Crypto
+        ("BTC-USD","Bitcoin","Crypto","Cryptocurrency","Global"),
+        ("ETH-USD","Ethereum","Crypto","Cryptocurrency","Global"),
+        ("SOL-USD","Solana","Crypto","Cryptocurrency","Global"),
+        ("XRP-USD","XRP / Ripple","Crypto","Cryptocurrency","Global"),
+        ("BNB-USD","Binance Coin","Crypto","Cryptocurrency","Global"),
+        ("DOGE-USD","Dogecoin","Crypto","Cryptocurrency","Global"),
+        ("ADA-USD","Cardano","Crypto","Cryptocurrency","Global"),
+        ("AVAX-USD","Avalanche","Crypto","Cryptocurrency","Global"),
+        # Commodities
+        ("GC=F","Gold Futures","COMEX","Commodities","Global"),
+        ("SI=F","Silver Futures","COMEX","Commodities","Global"),
+        ("CL=F","Crude Oil WTI","NYMEX","Commodities","Global"),
+        ("NG=F","Natural Gas","NYMEX","Commodities","Global"),
+        ("HG=F","Copper Futures","COMEX","Commodities","Global"),
+        # Forex
+        ("ILS=X","USD/ILS Exchange Rate","Forex","Forex","IL"),
+        ("EURUSD=X","EUR/USD Rate","Forex","Forex","EU"),
+        ("GBPUSD=X","GBP/USD Rate","Forex","Forex","GB"),
+        ("JPY=X","USD/JPY Rate","Forex","Forex","JP"),
     ]
     # Build search index: lowercase name + symbol → catalog entry
     _CATALOG_IDX = []
@@ -227,6 +269,7 @@ data:
                 return round(float(v), 2) if not pd.isna(v) and len(closes) >= w else None
             ma50  = ma(50)
             ma100 = ma(100)
+            ma150 = ma(150)
             ma200 = ma(200)
             rsi  = calc_rsi(closes)
             macd = calc_macd(closes)
@@ -239,6 +282,7 @@ data:
                 "closes": [round(float(v), 2) for v in closes.iloc[-N:]],
                 "ma50":   rolling_series(50),
                 "ma100":  rolling_series(100),
+                "ma150":  rolling_series(150),
                 "ma200":  rolling_series(200),
             }
             # Fundamentals
@@ -290,7 +334,7 @@ data:
             def rescale(v): return round(v * factor, 2) if v else v
             entry = {
                 "price":    rescale(cur), "change": rescale(chg), "pct": round(pct, 2),
-                "ma50":     rescale(ma50), "ma100": rescale(ma100), "ma200": rescale(ma200),
+                "ma50":     rescale(ma50), "ma100": rescale(ma100), "ma150": rescale(ma150), "ma200": rescale(ma200),
                 "volume":   int(hist["Volume"].iloc[-1]),
                 "name":     fund["name"], "sector": fund["sector"],
                 "currency": display_ccy,
@@ -347,7 +391,7 @@ data:
                     result.append({
                         "symbol": sym, "name": d.get("name", sym),
                         "price": d["price"], "change": d["change"], "pct": d["pct"],
-                        "ma50": d.get("ma50"), "ma100": d.get("ma100"), "ma200": d.get("ma200"),
+                        "ma50": d.get("ma50"), "ma100": d.get("ma100"), "ma150": d.get("ma150"), "ma200": d.get("ma200"),
                         "volume": d.get("volume", 0), "sector": d.get("sector", ""),
                         "currency": d.get("currency", "USD"),
                         "rsi": d.get("rsi"), "macd_data": d.get("macd_data"),
@@ -387,11 +431,12 @@ data:
             sym  = item["symbol"].upper()
             name = item["name"].upper()
             score = 0
-            if sym == qu:                          score = 100
-            elif sym.startswith(qu):               score = 85
-            elif qu in sym:                        score = 70
-            elif name.startswith(qu):              score = 55
-            elif qu in name:                       score = 40
+            if sym == qu:                                            score = 100
+            elif sym.startswith(qu):                                 score = 85
+            elif qu in sym:                                          score = 70
+            elif name.startswith(qu):                                score = 65
+            elif any(w.startswith(qu) for w in name.split() if w):  score = 60
+            elif qu in name:                                         score = 40
             else:
                 continue
             results.append({**item, "score": score, "in_watchlist": item["symbol"] in wl})
@@ -600,12 +645,12 @@ data:
     /* MAIN */
     .main{display:flex;flex:1;overflow:hidden}
     /* WATCHLIST */
-    .watchlist{width:520px;border-right:1px solid #21262d;display:flex;flex-direction:column;flex-shrink:0}
+    .watchlist{width:570px;border-right:1px solid #21262d;display:flex;flex-direction:column;flex-shrink:0}
     .wl-header{background:#161b22;border-bottom:1px solid #21262d;padding:0 8px;flex-shrink:0}
-    .wl-cols{display:grid;grid-template-columns:62px 1fr 76px 60px 72px 72px 72px 28px;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;padding:6px 4px;font-weight:600}
+    .wl-cols{display:grid;grid-template-columns:62px 1fr 72px 58px 62px 62px 62px 62px 26px;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;padding:6px 4px;font-weight:600}
     .wl-cols span{text-align:right}.wl-cols span:first-child,.wl-cols span:nth-child(2){text-align:left}
     .wl-body{overflow-y:auto;flex:1}
-    .wl-row{display:grid;grid-template-columns:62px 1fr 76px 60px 72px 72px 72px 28px;align-items:center;padding:7px 4px;border-bottom:1px solid #21262d0a;cursor:pointer;transition:background .1s}
+    .wl-row{display:grid;grid-template-columns:62px 1fr 72px 58px 62px 62px 62px 62px 26px;align-items:center;padding:7px 4px;border-bottom:1px solid #21262d0a;cursor:pointer;transition:background .1s}
     .wl-row:hover{background:#161b2280}
     .wl-row.active{background:#1f6feb15;border-left:2px solid #58a6ff}
     .sym{font-size:13px;font-weight:700}
@@ -687,7 +732,7 @@ data:
           <div class="wl-cols">
             <span>Symbol</span><span>Name</span>
             <span>Price</span><span>Chg%</span>
-            <span>MA 50</span><span>MA 100</span><span>MA 200</span>
+            <span>MA 50</span><span>MA 100</span><span>MA 150</span><span>MA 200</span>
             <span></span>
           </div>
         </div>
@@ -706,6 +751,7 @@ data:
             <div class="ch-ma-item"><div class="ch-ma-dot" style="background:#58a6ff"></div><span id="leg-price">Price</span></div>
             <div class="ch-ma-item"><div class="ch-ma-dot" style="background:#f0883e"></div><span id="leg-50">MA 50</span></div>
             <div class="ch-ma-item"><div class="ch-ma-dot" style="background:#d2a8ff"></div><span id="leg-100">MA 100</span></div>
+            <div class="ch-ma-item"><div class="ch-ma-dot" style="background:#3fb950"></div><span id="leg-150">MA 150</span></div>
             <div class="ch-ma-item"><div class="ch-ma-dot" style="background:#f85149"></div><span id="leg-200">MA 200</span></div>
           </div>
         </div>
@@ -828,7 +874,14 @@ data:
       return sym && sym.endsWith('.TA') ? '₪' : '$';
     }
     // Display name — strip .TA suffix for cleaner watchlist
-    function dispSym(sym) { return sym && sym.endsWith('.TA') ? sym.slice(0, -3) : sym; }
+    function dispSym(sym) {
+      if (!sym) return sym;
+      if (sym.endsWith('.TA')) return sym.slice(0, -3);
+      if (sym.endsWith('-USD')) return sym.slice(0, -4);
+      const M = {'GC=F':'GOLD','SI=F':'SILVER','CL=F':'OIL','NG=F':'GAS','HG=F':'COPPER',
+                 'ILS=X':'USD/ILS','EURUSD=X':'EUR/USD','GBPUSD=X':'GBP/USD','JPY=X':'USD/JPY'};
+      return M[sym] || sym;
+    }
 
     // ── Investing.com-style search ────────────────────────────────────
     const FLAG = { US:'🇺🇸', IL:'🇮🇱', NL:'🇳🇱', DE:'🇩🇪', CA:'🇨🇦', SE:'🇸🇪', GB:'🇬🇧' };
@@ -971,7 +1024,11 @@ data:
         const pos  = d.change >= 0;
         const act  = sel === sym ? ' active' : '';
         const c    = ccy(sym);
-        const label = dispSym(sym) + (sym.endsWith('.TA') ? '<span class="tase-badge">TA</span>' : '');
+        const badge = sym.endsWith('.TA')   ? '<span class="tase-badge">TA</span>'
+                    : sym.endsWith('-USD') ? '<span class="tase-badge" style="background:#f0883e22;color:#f0883e;border-color:#f0883e44">₿</span>'
+                    : sym.includes('=')   ? '<span class="tase-badge" style="background:#58a6ff22;color:#58a6ff;border-color:#58a6ff44">FX</span>'
+                    : '';
+        const label = dispSym(sym) + badge;
         html += `<div class="wl-row${act}" onclick="selectStock('${sym}')">
           <div><div class="sym">${label}</div></div>
           <div class="sname" title="${d.name}">${d.name||sym}</div>
@@ -979,6 +1036,7 @@ data:
           <div class="chg ${pos?'pos':'neg'}">${pos?'+':''}${fmt(d.pct,2)}%</div>
           <div class="ma-cell"><span class="ma-val">${d.ma50?c+fmt(d.ma50):'—'}</span>${maInd(d.price,d.ma50)}</div>
           <div class="ma-cell"><span class="ma-val">${d.ma100?c+fmt(d.ma100):'—'}</span>${maInd(d.price,d.ma100)}</div>
+          <div class="ma-cell"><span class="ma-val">${d.ma150?c+fmt(d.ma150):'—'}</span>${maInd(d.price,d.ma150)}</div>
           <div class="ma-cell"><span class="ma-val">${d.ma200?c+fmt(d.ma200):'—'}</span>${maInd(d.price,d.ma200)}</div>
           <div class="del-btn" onclick="event.stopPropagation();removeStock('${sym}')">✕</div>
         </div>`;
@@ -1058,6 +1116,7 @@ data:
         { label: 'Price', data: c.closes, borderColor: '#58a6ff', borderWidth: 2, pointRadius: 0, tension: 0.2, fill: false, order: 1 },
         { label: 'MA 50',  data: c.ma50,  borderColor: '#f0883e', borderWidth: 1.5, borderDash: [], pointRadius: 0, tension: 0, fill: false, spanGaps: true },
         { label: 'MA 100', data: c.ma100, borderColor: '#d2a8ff', borderWidth: 1.5, borderDash: [4,3], pointRadius: 0, tension: 0, fill: false, spanGaps: true },
+        { label: 'MA 150', data: c.ma150, borderColor: '#3fb950', borderWidth: 1.5, borderDash: [3,2], pointRadius: 0, tension: 0, fill: false, spanGaps: true },
         { label: 'MA 200', data: c.ma200, borderColor: '#f85149', borderWidth: 1.5, borderDash: [6,3], pointRadius: 0, tension: 0, fill: false, spanGaps: true },
       ];
       // Update legend values
@@ -1065,6 +1124,7 @@ data:
       document.getElementById('leg-price').textContent = 'Price ' + cc + fmt(d.price);
       document.getElementById('leg-50').textContent    = 'MA 50 '  + (d.ma50  ? cc+fmt(d.ma50)  : '—');
       document.getElementById('leg-100').textContent   = 'MA 100 ' + (d.ma100 ? cc+fmt(d.ma100) : '—');
+      document.getElementById('leg-150').textContent   = 'MA 150 ' + (d.ma150 ? cc+fmt(d.ma150) : '—');
       document.getElementById('leg-200').textContent   = 'MA 200 ' + (d.ma200 ? cc+fmt(d.ma200) : '—');
       chart = new Chart(ctx, {
         type: 'line',
